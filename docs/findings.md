@@ -124,7 +124,46 @@ If bytes 4-5 are unsigned 0-255 representing the full pan/tilt range:
   0xae = -82 (left of center), making the move a 172° swing. **Consistent
   with "full left from center".**
 
-### Session 4 (added live): tilt-up confirmation
+### Session 5: factory Default Home position
+
+User pressed the Blink app's "Default Home" button. Capture:
+
+| Session | State | Raw payload |
+|---|---|---|
+| 5 | factory Default Home | `01` `08 7a 66` `3e` `b4` `00` |
+
+**Key surprise:** byte 4 came back to `0x3e` (62), NOT to `0x5a` (90) like
+sessions 1-2 had. So sessions 1-2 were NOT actually at the factory home —
+they were at "wherever the Rosie was left from prior usage". Byte 5 returned
+to `0xb4` (matching the no-tilt readings in sessions 1, 2, and 4), so
+**factory tilt-home is `0xb4` (180)**.
+
+**Byte 0 anomaly:** sessions 1-4 had byte 0 monotonically incrementing
+00 → 01 → 02 → 03. Session 5 has byte 0 = `0x01`, breaking the
+"session-counter" theory. It's something else — possibly:
+- a change-class code (e.g., 01 = "single-axis change"?)
+- a counter scoped to physical state changes, reset by the "Default Home"
+  command
+- a flag that distinguishes "factory-set" vs "user-set" state
+- noise / not really a counter at all (just looked like one across 4 samples)
+
+**ACCESSORY_MESSAGE seq jumped to `seq=3`** for this 7-byte payload (was
+seq=2 in every prior session). The seq field on accessory state-update
+messages might increment per state change rather than per session.
+
+**Pan-range constraint from two known positions:**
+- `0x3e` (62) = factory pan home
+- `0xae` (174) = app-reported "full left"
+- Delta = +112 units
+
+If pan range is 350° total and the byte is linear: 112 / 256 ≈ 44% of the
+byte range = ~154°. That's only about half of a full mechanical pan swing.
+Either the app didn't reach the mechanical stop, or the encoding isn't a
+linear 0-255 over the full range. **Full-right capture is the next needed
+data point** — it will tell us whether the byte decreases below 0x3e (left
+= increasing convention only) or wraps high (modular encoding).
+
+### Session 4: tilt-up confirmation
 
 User left the pan at full-left and tilted the mount fully up via the app.
 Capture:
