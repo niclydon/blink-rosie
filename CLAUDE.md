@@ -220,13 +220,44 @@ the body correctly. The first byte of the body must be the type
 Probe D's body `055ab4` parsed as: type=`0x05` (invalid → silent discard
 with "incorrect type" log).
 
-**What's still unknown:** the valid `command` (uint32) values for Rosie
-movement. The walnut.so binary itself has no string constants like
-"rosie_pan" or "tilt_set" — the integer cmd_ids come from the Kotlin/Java
-app layer in `base.apk` (`classes.dex`), which needs `jadx` or `apktool`
-to decompile. Alternative: brute-force `command` 0..0x40 with the correct
-body shape now that the framing is known — each probe will be parsed
-properly instead of silently discarded.
+**The valid cmd_id values were extracted from the Blink Android app's
+Kotlin code** by decompiling `base.apk`'s `classes.dex` with `jadx` 1.5.5.
+The full table is in `com.immediasemi.blink.utils.liveview.LiveViewCommand`:
+
+| outer msgtype | inner type | cmd_id | Name | Payload format |
+|---|---|---|---|---|
+| 0x14 | 0x14 | 1 | LightsOn (Storm) | _unknown_ |
+| 0x14 | 0x14 | 2 | LightsOff | _unknown_ |
+| **0x14** | **0x14** | **3** | **RosieMove** | **`00 00 00 00 PAN TILT 00`** (7 bytes) |
+| **0x14** | **0x14** | **4** | **RosieStop** | empty |
+| **0x14** | **0x14** | **5** | **RosieGoHome** | empty |
+| **0x14** | **0x14** | **6** | **RosieSetHome** | empty |
+| **0x14** | **0x14** | **7** | **Rosie360** | empty |
+| 0x14 | 0x14 | 8 | SirenOn | _unknown_ |
+| 0x14 | 0x14 | 9 | SirenOff | _unknown_ |
+| 0x17 | 0x17 | 1 | SaveClip | _unknown_ |
+| 0x17 | 0x17 | 2 | DiscardClip | _unknown_ |
+| 0x17 | 0x17 | 3 | StartAudio | empty |
+| 0x17 | 0x17 | 4 | StopAudio | empty |
+| 0x17 | 0x17 | 5 | ToggleExtended | _unknown_ |
+
+So the on-wire RosieMove command, panning to home (0x5a) and tilting to
+center (0xb4):
+
+```
+14  XX XX XX XX  00 00 00 0c   14  00 00 00 03   00 00 00 00 5a b4 00
+└────── msgtype ───────────── ─┘ └─inner type─┘└─cmd_id=3─┘└── 7-byte payload ──┘
+                              length=12=0x0c
+```
+
+The receive-side handler in `WalnutRosieNavigator.java` confirms our
+Phase 2 wire-format decode byte-for-byte (`payload[4]` = pan,
+`payload[5]` = tilt). It also reveals what the 4-byte ACCESSORY_MESSAGE
+we observed in every session (`06 ae 77 f1`) actually means: **it's the
+`ROSIE_LIMITS` accessory message**, encoding `[pan_min=0x06,
+pan_max=0xae, tilt_min=0x77, tilt_max=0xf1]` — the exact mechanical
+limits we triangulated independently via physical pan/tilt experiments.
+The server was telling us the limits the whole time.
 
 The community references (sealad886's TS enum, blinkpy) did not document
 0x06, 0x0c, 0x13, or the bidirectional KEEPALIVE behavior. Original

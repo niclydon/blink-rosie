@@ -12,6 +12,125 @@ Newest at the top. Cite source files / packet captures where applicable.
 - blink-mcp confirmed available on the network for authenticated REST access.
 - Reference repos cloned into `refs/` (not vendored — see `.gitignore`).
 
+## 2026-05-19 — Phase 3 COMPLETE: full cmd_id table + payload formats from classes.dex
+
+After the wire format was extracted from `libwalnut.so`, installed `jadx`
+1.5.5 (needed `default-jre-headless`) and decompiled `base.apk` (~366 MB
+of Java sources from 27,371 classes). One `grep` against
+`submitInlineLVCommand` and the entire protocol was visible.
+
+**Call site** at
+`com/immediasemi/blink/video/live/sessionmanager/walnut/BlinkWalnutLiveViewSessionManager.java:455`:
+
+```java
+player.submitInlineLVCommand(command.getCommandTypeId(), command.getCommandId(), payload);
+```
+
+The `command` arg is a `LiveViewCommand` instance. That class is a sealed
+Kotlin hierarchy at
+`com/immediasemi/blink/utils/liveview/LiveViewCommand.java`. Two
+subclasses — `InlineCommand(type=INLINE_COMMAND=0x14)` and
+`SessionCommand(type=SESSION_COMMAND=0x17)` — and each concrete command
+calls `super(<cmd_id>)` to set the integer cmd_id.
+
+**Complete LiveViewCommand enum (type, cmd_id, name):**
+
+| type | cmd_id | Name | Payload format |
+|---|---|---|---|
+| **0x14** | **1** | LightsOn (Storm floodlight) | _unknown_ |
+| **0x14** | **2** | LightsOff | _unknown_ |
+| **0x14** | **3** | **RosieMove** | **`00 00 00 00 PAN TILT 00`** (7 bytes) |
+| **0x14** | **4** | **RosieStop** | empty |
+| **0x14** | **5** | **RosieGoHome** | empty |
+| **0x14** | **6** | **RosieSetHome** | empty |
+| **0x14** | **7** | **Rosie360** (full pan overview) | empty |
+| 0x14 | 8 | SirenOn | _unknown_ |
+| 0x14 | 9 | SirenOff | _unknown_ |
+| 0x17 | 1 | SaveClip | _unknown_ |
+| 0x17 | 2 | DiscardClip | _unknown_ |
+| 0x17 | 3 | StartAudio | empty (matches sealad886) |
+| 0x17 | 4 | StopAudio | empty (matches sealad886) |
+| 0x17 | 5 | ToggleExtended | _unknown_ |
+
+**RosieMove payload format** at
+`WalnutRosieNavigator.java:moveTo()`:
+
+```java
+@Override
+public void moveTo(int panAngle, int tiltAngle) {
+    this.commandSubmitter.submitCommand(
+        LiveViewCommand.RosieMove.INSTANCE,
+        new byte[]{0, 0, 0, 0, (byte) panAngle, (byte) tiltAngle, 0}
+    );
+}
+```
+
+So the on-wire `RosieMove` packet, panning to home and tilting to center,
+looks like:
+
+```
+14  XX XX XX XX  00 00 00 0c   14  00 00 00 03   00 00 00 00 5a b4 00
+└──── msgtype                ─┘└── inner type ─┘└─ cmd_id=3 ─┘└── 7-byte payload ──┘
+                              length=12=0x0c                    pan=0x5a tilt=0xb4
+```
+
+**Receive-side parser** (also in `WalnutRosieNavigator.java`) **confirms
+our Phase 2 wire-format decode byte-for-byte**:
+
+```java
+private final RosieNavigator.Position payloadToRosiePosition(byte[] payload, boolean isHomePosition) {
+    return new RosieNavigator.Position(isHomePosition,
+        UByte.m14243constructorimpl(payload[4]) & 255,  // ← PAN at byte 4
+        UByte.m14243constructorimpl(payload[5]) & 255,  // ← TILT at byte 5
+        payload[6]);                                     // byte 6
+}
+```
+
+The same 7-byte format is used in both directions:
+
+- **Client → server** (RosieMove): `00 00 00 00 PAN TILT 00`. Bytes 0-3
+  are always zero on send.
+- **Server → client** (POSITION update via ACCESSORY_MESSAGE 0x15):
+  `<state-counter> <3-byte-hash> PAN TILT <flag>`. Bytes 0-3 carry
+  state-version metadata; bytes 4-5 are the position; byte 6 may indicate
+  isHome (we always saw 0x00 in captures, presumably meaning "not at
+  home").
+
+**Receive-side accessory message types** (from `handleAccessoryMessage`):
+
+| `LiveViewAccessoryMessage.<NAME>` | What it carries |
+|---|---|
+| `POSITION` | 7-byte position snapshot (we observed this in every session at seq=2) |
+| `HOME_POSITION` | 7-byte snapshot but flagged as the home position |
+| `ROSIE_LIMITS` | 4-byte payload: `[pan_min, pan_max, tilt_min, tilt_max]` |
+| `ROSIE_PAN_360_COMPLETE` | Empty — signals Rosie360 sweep finished |
+
+**The 4-byte `06ae77f1` ACCESSORY_MESSAGE (seq=4) we observed in every
+session is almost certainly `ROSIE_LIMITS`** — the structure matches
+exactly: `06 ae 77 f1` = `pan_min=0x06, pan_max=0xae, tilt_min=0x77,
+tilt_max=0xf1`. Those are the exact mechanical limit values we
+triangulated by panning/tilting the camera. **The server was telling us
+the limits the entire time — we just didn't know that's what the bytes
+meant.** Confirmation of our pan/tilt range bounds without needing
+physical experimentation, but we got there independently first.
+
+### Phase 3 wrap
+
+Every protocol detail we need for programmatic Rosie control is now in
+hand:
+
+- Outer IMMIS msgtype: `0x14` (INLINE_COMMAND)
+- Inner type byte: `0x14`
+- cmd_id: 3 for move, 4 for stop, 5 for goHome, 6 for setHome, 7 for 360
+- Payload: 7 bytes `00 00 00 00 PAN TILT 00` for move; empty for the rest
+- Pan range: `0x06` (right) to `0xae` (left), center `0x5a`
+- Tilt range: `0x77` (down) to `0xf1` (up), center `0xb4`
+
+Next step: build the send path in `immis_client.py` (`--send-rosie-cmd`
+mode) and try `RosieGoHome` first as the lowest-risk test of the format
+(empty payload, sends mount to user's saved home position — known
+movement, predictable target).
+
 ## 2026-05-19 — Phase 3 (libwalnut.so analysis): wire format decoded from disassembly
 
 Pivoted from iOS class-dump (user has no IPA, no jailbroken phone) to
