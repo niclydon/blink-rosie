@@ -353,16 +353,78 @@ blink-rosie/
 
 ## Authentication Notes
 
-The Blink API uses OAuth 2.0 with 2FA. The blink-mcp server already handles authentication. For standalone scripts, use blinkpy's auth flow or extract credentials from the existing blink-mcp session.
+The Blink API uses OAuth 2.0 with 2FA. **Reuse the blink-mcp session instead of re-doing auth.** blink-mcp's Python bootstrap (`~/projects/blink-mcp/scripts/auth.py`) drives the OAuth + 2FA dance via `blinkpy` and writes the result to `~/.blink-mcp/session.json` (chmod 600). The session file is the auth boundary between blink-mcp and blink-rosie.
 
-Required headers for REST API calls:
+Session file fields (already populated for this account):
+```
+access_token, refresh_token, tier, account_id, client_id, user_id,
+unique_id (= blinkpy's hardware_id), expiration_date (epoch seconds), expires_in (4h)
+```
+
+### REST API headers — minimum that works
+
+Blink-mcp proved this header set in production:
+
 ```
 Authorization: Bearer {access_token}
-Content-Type: application/json; charset=UTF-8
-locale: en_US
+Content-Type: application/json     # only when sending a body
+Accept: application/json
 ```
 
-The User-Agent should mimic the Blink app to avoid detection by Lab126 (Amazon's hardware division that develops Blink).
+**Do not send User-Agent or APP-BUILD headers on REST calls.** They're checked against expectations baked into the OAuth-issued token and trigger HTTP 426 ("app update required"). The Blink-app User-Agent string is only for the OAuth refresh endpoint, not for general REST traffic. (CLAUDE.md previously said the opposite — that was wrong; corrected 2026-05-19 after reading `~/projects/blink-mcp/src/blink/client.ts:252-261`.)
+
+### OAuth refresh
+
+`POST https://api.oauth.blink.com/oauth/token`, form-encoded:
+
+```
+grant_type=refresh_token
+refresh_token={session.refresh_token}
+client_id=ios
+scope=client
+hardware_id={session.unique_id}
+```
+
+Headers for this call only:
+```
+User-Agent: Blink/2511191620 CFNetwork/3860.200.71 Darwin/25.1.0
+Content-Type: application/x-www-form-urlencoded
+Accept: */*
+```
+
+Refresh proactively when `expiration_date - now <= 300s`, or reactively on any 401/403. Single-flight the refresh so concurrent callers don't stampede. After refresh, atomic-write the updated session back to `~/.blink-mcp/session.json` (chmod 600) so blink-mcp picks up the new token too.
+
+### When refresh fails
+
+If the OAuth endpoint returns a non-200, the refresh_token is dead. Re-bootstrap from blink-mcp:
+
+```bash
+cd ~/projects/blink-mcp
+eval "$(~/projects/secrets-vault/bin/sv get blink-mcp)"
+npm run auth   # = uv run scripts/auth.py — prompts for 2FA PIN
+```
+
+### Already-tried REST paths (do NOT re-probe in Phase 1)
+
+blink-mcp's 2026-05-19 narrative documents these top-level probes as **404**:
+
+- `GET /rosie`
+- `GET /rosies/{id}`
+- `GET /accessories/*` (any generic, non-camera-scoped form)
+
+The camera-config endpoint (`/api/v1/accounts/{a}/networks/{n}/owls/{c}/config`) exposes only `{"rosie": {"calibrated": true, "calibration_compatible": true}}` — no movement controls. Phase 1 should focus on the **camera-scoped** accessory path (`/networks/{n}/cameras|owls/{c}/accessories/rosie/{rosieId}/...`), which is the shape that works for Storm floodlights.
+
+### Live target inventory (account-specific)
+
+| Field | Value |
+|---|---|
+| Network | `MyHome` / `12345` |
+| Rosie's camera | `LivingRoom` / `1234567` (type `owl`) |
+| Rosie accessory id | `54321` |
+| Rosie serial | `GPXXXXXXXXXXXXXX` |
+| Other camera (no Rosie) | `BedRoom` / `1234568` |
+
+Account ID and tier are in `~/.blink-mcp/session.json` — never commit those.
 
 ## Success Criteria
 
