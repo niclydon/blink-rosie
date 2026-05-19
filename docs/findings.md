@@ -124,19 +124,27 @@ If bytes 4-5 are unsigned 0-255 representing the full pan/tilt range:
   0xae = -82 (left of center), making the move a 172° swing. **Consistent
   with "full left from center".**
 
-### Session 5: factory Default Home position
+### Session 5: user-configured "Default View" position
 
-User pressed the Blink app's "Default Home" button. Capture:
+User pressed the Blink app's "Default View" button. **Critical caveat from
+the user (recorded after the original capture write-up):** "Default View" is
+a **user-configured** preset that the user themselves chose during app
+setup, not a factory-set reference. So this position is not canonical —
+it's just where the user pointed the mount and saved as their preferred
+default. We do NOT yet have a known mechanical-center or factory-home
+reference in our captured data. Treat ALL position byte values seen so far
+as samples from arbitrary user-chosen positions.
+
+Capture:
 
 | Session | State | Raw payload |
 |---|---|---|
-| 5 | factory Default Home | `01` `08 7a 66` `3e` `b4` `00` |
+| 5 | user "Default View" preset | `01` `08 7a 66` `3e` `b4` `00` |
 
-**Key surprise:** byte 4 came back to `0x3e` (62), NOT to `0x5a` (90) like
-sessions 1-2 had. So sessions 1-2 were NOT actually at the factory home —
-they were at "wherever the Rosie was left from prior usage". Byte 5 returned
-to `0xb4` (matching the no-tilt readings in sessions 1, 2, and 4), so
-**factory tilt-home is `0xb4` (180)**.
+**What we still know:** byte 4 = `0x3e` (62), byte 5 = `0xb4` (180) in this
+sample. Byte 5 matches the no-tilt readings in sessions 1, 2, and 4, so
+**`0xb4` reliably means "tilt-axis at the position the user calls home"**
+— that's plausibly mechanical center but not yet proven.
 
 **Byte 0 anomaly:** sessions 1-4 had byte 0 monotonically incrementing
 00 → 01 → 02 → 03. Session 5 has byte 0 = `0x01`, breaking the
@@ -151,17 +159,18 @@ to `0xb4` (matching the no-tilt readings in sessions 1, 2, and 4), so
 seq=2 in every prior session). The seq field on accessory state-update
 messages might increment per state change rather than per session.
 
-**Pan-range constraint from two known positions:**
-- `0x3e` (62) = factory pan home
-- `0xae` (174) = app-reported "full left"
+**Pan-range constraint from two arbitrary user positions:**
+- `0x3e` (62) = the user's chosen "Default View" preset
+- `0xae` (174) = app's "full left" gesture from there
 - Delta = +112 units
 
-If pan range is 350° total and the byte is linear: 112 / 256 ≈ 44% of the
-byte range = ~154°. That's only about half of a full mechanical pan swing.
-Either the app didn't reach the mechanical stop, or the encoding isn't a
-linear 0-255 over the full range. **Full-right capture is the next needed
-data point** — it will tell us whether the byte decreases below 0x3e (left
-= increasing convention only) or wraps high (modular encoding).
+Neither point is anchored to a mechanical or factory reference, so this
+delta only tells us that the byte moved by +112 when the mount swung
+from "user default" to "as far left as the app gesture went." Whether
+`0xae` is at the mechanical pan-left stop, or only partway, is unknown.
+**Full-right capture is the next needed data point** — it tells us
+whether the byte decreases below `0x3e` (signed/bidirectional encoding)
+or wraps high past `0xae` (unsigned increasing-with-left convention).
 
 ### Session 4: tilt-up confirmation
 
