@@ -100,16 +100,62 @@ Followed by `payload_length` bytes of payload data.
 | Name | Hex | Direction | Purpose |
 |------|-----|-----------|---------|
 | VIDEO | 0x00 | server -> client | MPEG-TS video data (payload starts with 0x47 sync byte) |
-| KEEPALIVE | 0x0A | client -> server | Keep-alive ping, sent every 10 seconds, no payload |
+| AUTH_ACK *(provisional)* | 0x06 | server -> client | **Live-observed (2026-05-19).** First packet after we send the auth header, len=0, seq=0. Almost certainly the auth ACK. |
+| KEEPALIVE | 0x0A | **bidirectional** | Live capture confirms server echoes our sequence numbers — ping/pong RTT, not fire-and-forget. Client sends every 10s; server replies within 30-50ms. |
+| 0x0C *(undocumented)* | 0x0C | server -> client | **Live-observed.** Len=0, sequence field always `0xA0000001`. The sequence number looks like a packed bitmask, not a counter. Purpose unknown. |
 | LATENCY_STATS | 0x12 | client -> server | 24-byte stats payload, sent every 1 second |
+| SESSION_CONFIG *(provisional)* | 0x13 | server -> client | **Live-observed.** 26-byte payload containing the timing constants `0x1388` (5000), `0x03e8` (1000 ×2), `0x0064` (100). Looks like session-config block (latency interval, keepalive interval, etc.). |
 | INLINE_COMMAND | 0x14 | bidirectional | "Device control" - purpose not fully explored |
-| **ACCESSORY_MESSAGE** | **0x15** | **bidirectional** | **Pan/tilt commands almost certainly use this type** |
+| **ACCESSORY_MESSAGE** | **0x15** | **bidirectional** | **Confirmed: Rosie state updates ride here.** Server sends two of these in the setup burst at every session start (1.4-1.6s after auth). See "ACCESSORY_MESSAGE wire format" below. |
 | SESSION_COMMAND | 0x17 | client -> server | Start/Stop audio (command IDs: 3=StartAudio, 4=StopAudio) |
-| SESSION_MESSAGE | 0x18 | bidirectional | ACKs, control-plane updates, audio uplink frames |
+| SESSION_MESSAGE | 0x18 | bidirectional | ACKs, control-plane updates, audio uplink frames. Two arrive (seq=1, seq=4) in every session-setup burst. |
 
-The `ACCESSORY_MESSAGE (0x15)` type is the primary target. Post-live-view logs from the Blink app contain counters confirming accessory messages are exchanged during pan/tilt sessions:
-- `IMMI_DATA_FLAG_ACCESSORY_MSG` (received counter)
-- `IMMI_DATA_FLAG_INLINE_LV_CMD` (sent counter)
+**Important wire-protocol fact discovered in live capture (2026-05-19):**
+the 9-byte header's sequence field is NOT a single connection-wide counter
+— **each message type maintains its own sequence space**. ACCESSORY_MESSAGE
+seqs run independently of SESSION_MESSAGE seqs etc. Code that tracks or
+replays packets must key by (msgtype, seq), not just seq.
+
+#### ACCESSORY_MESSAGE wire format (server → client, live-derived)
+
+Two ACCESSORY_MESSAGE packets arrive in every session-setup burst. Both
+have been characterized across 4 live sessions on Rosie 54321 (LivingRoom):
+
+**4-byte packet (seq=4)** — stable across all sessions and across position
+changes. Hypothesis: **per-rosie identity / device class hash**.
+
+```
+06 ae 77 f1
+└┬┘ └──┬──┘
+ │     └─ rosie-specific constant (model? calibration? serial-hash?)
+ └─ accessory class code (rosie = 0x06?)
+```
+
+**7-byte packet (seq=2)** — the **current Rosie position snapshot**.
+Confirmed by panning the mount full-left (byte 4 changes) and tilting up
+(byte 5 changes):
+
+```
+[0]    state-version counter (00 → 01 → 02 → ... increments each session/state-update)
+[1-3]  state-change hash or timestamp (variable, no clear structure yet)
+[4]    PAN position byte   — 0x5a at home, 0xae at full-left
+[5]    TILT position byte  — 0xb4 at home, 0xf1 at full-up
+[6]    0x00 trailer
+```
+
+At home position, the canonical payload is `XX YY YY YY 5a b4 00`
+(`5a b4` = 90, 180). Encoding (signed vs unsigned, byte-to-degree mapping)
+is not yet fully characterized — see `docs/findings.md` for the
+session-by-session capture table. The **client→server command format is
+still unknown** — only server-push state has been observed.
+
+The community references (sealad886's TS enum, blinkpy) did not document
+0x06, 0x0c, 0x13, or the bidirectional KEEPALIVE behavior. Original
+hints used to motivate this work:
+- `IMMI_DATA_FLAG_ACCESSORY_MSG` (received counter, in Blink app logs)
+- `IMMI_DATA_FLAG_INLINE_LV_CMD` (sent counter — INLINE_COMMAND 0x14 still
+  unobserved in our captures; the mobile app probably sends 0x14 commands
+  and the server pushes 0x15 state updates back)
 
 #### IMMIS Authentication Header (122 bytes)
 

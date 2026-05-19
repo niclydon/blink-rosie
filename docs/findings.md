@@ -12,6 +12,160 @@ Newest at the top. Cite source files / packet captures where applicable.
 - blink-mcp confirmed available on the network for authenticated REST access.
 - Reference repos cloned into `refs/` (not vendored — see `.gitignore`).
 
+## 2026-05-19 — Phase 2.2 BREAKTHROUGH: wire-format candidate for Rosie position state
+
+**Built `src/immis_client.py`** — async TLS client that connects to a live
+IMMIS server, sends the 122-byte auth header, runs the latency_stats (1s) +
+keepalive (10s) heartbeat cadence, and logs every non-VIDEO frame with full
+hex dumps. Auth header construction validated byte-by-byte against
+CLAUDE.md's spec (all 9 offset checks pass).
+
+**Three live sessions captured** against LivingRoom (owl 1234567, rosie
+54321). Camera was at home position for sessions 1 & 2, then user panned the
+mount **fully to the left** via the Blink app before session 3.
+
+### Three undocumented message types observed
+
+Community references (CLAUDE.md, sealad886's enum, blinkpy) only documented
+0x00, 0x0a, 0x12, 0x14, 0x15, 0x17, 0x18. We additionally observed:
+
+| Type | Length | Sequence field | Notes |
+|---|---|---|---|
+| `0x06` | 0 | 0 | First packet from server post-auth (~0.5s after we send the auth header). **Almost certainly the auth ACK.** |
+| `0x0c` | 0 | `0xA0000001` (= 2684354561) | Identical across all 3 sessions. The sequence field looks like a packed bitmask (top bit + bottom bit set), not a counter — high bits probably encode a state flag. |
+| `0x13` | 26 | 0 | Structured payload: `00000000 0000000000 00 1388 03e8 03e8 0064 0000000000000000`. Numeric fields: 0x1388=5000, 0x03e8=1000 (x2), 0x0064=100. Looks like a **session-config block** with timing parameters (5000ms, 1000ms, 1000ms, 100ms). Identical across all 3 sessions. |
+
+### Setup-burst pattern (every session, t < 1.6s)
+
+Captured timeline against wall clock from session 1:
+
+```
+t=0.079s → client: 122-byte auth header
+t=0.538s ← server: 0x06 (auth ACK, len=0)
+t=0.674s ← server: KEEPALIVE seq=1 (echoes our seq=1 keepalive)
+t=1.405s ← server: SESSION_MESSAGE seq=1 len=0
+t=1.407s ← server: SESSION_MESSAGE seq=4 len=0
+t=1.437s ← server: 0x0c seq=0xA0000001 len=0
+t=1.440s ← server: 0x13 len=26 (session config)
+t=1.518s ← server: ACCESSORY_MESSAGE seq=4 len=4   payload=06ae77f1
+t=1.527s ← server: ACCESSORY_MESSAGE seq=2 len=7   payload=006a5e425ab400
+t=1.578s ← server: first VIDEO frame (MPEG-TS, 0x47 sync confirmed)
+```
+
+After t≈1.6s, only VIDEO (~4300 packets / 30s, ~5MB) and 10-second keepalive
+ping-pong. **No further ACCESSORY_MESSAGE traffic on an idle connection** —
+the server pushes 0x15 only at session start (state snapshot) and presumably
+on state-change events.
+
+### Bidirectional KEEPALIVE with sequence echo (NEW)
+
+CLAUDE.md described KEEPALIVE (0x0a) as client→server only. Live capture
+shows it's **bidirectional with sequence-number echo**:
+
+```
+t= 0.079s tx KEEPALIVE seq=1
+t= 0.674s rx KEEPALIVE seq=1  (33-50ms after we sent)
+t=10.086s tx KEEPALIVE seq=2
+t=10.120s rx KEEPALIVE seq=2
+t=20.091s tx KEEPALIVE seq=3
+t=20.140s rx KEEPALIVE seq=3
+```
+
+The server echoes our sequence numbers back. This is an actual ping-pong
+RTT mechanism, not just "keep the socket warm".
+
+### Per-type sequence spaces (NEW)
+
+In session 1, ACCESSORY_MESSAGE seq numbers were 2 and 4 — but
+SESSION_MESSAGE seq numbers were ALSO 1 and 4 with no overlap. The 9-byte
+header's sequence field isn't a single connection-wide counter; **each
+message type maintains its own independent sequence space**. This matters
+for any code that wants to track or replay packets.
+
+### The Rosie state-snapshot finding
+
+Two ACCESSORY_MESSAGE payloads arrived in every session. The 4-byte one is
+stable across all sessions; the 7-byte one has a stable 3-byte trailer and a
+variable 4-byte prefix.
+
+**4-byte ACCESSORY_MESSAGE (seq=4)** — `06ae77f1`. Identical in all 3
+sessions. Hypothesis: per-rosie identity / type code / config hash. Byte 0
+`0x06` could be an accessory-class identifier; bytes 1-3 `ae 77 f1` could be
+a Rosie-model parameter, calibration hash, or fixed device constant.
+
+**7-byte ACCESSORY_MESSAGE (seq=2)** — variable across sessions:
+
+| Session | Camera state | Raw payload |
+|---|---|---|
+| 1 | home position | `00` `6a 5e 42` `5a` `b4` `00` |
+| 2 | home (5 min later) | `01` `2d 63 a7` `5a` `b4` `00` |
+| 3 | **panned full LEFT** | `02` `3c 03 37` `ae` `b4` `00` |
+
+**Byte 4 changed `0x5a` → `0xae` when the Rosie was panned.** Byte 5
+unchanged (`0xb4`). Byte 0 increments every session (`00 → 01 → 02`).
+Bytes 1-3 look like a per-state hash or timestamp. Byte 6 is always `0x00`.
+
+### Working format hypothesis for the 7-byte payload
+
+```
+[0]    state-version counter — increments every state update, 0-255 wrap
+[1-3]  state-change hash or timestamp (variable, no clear structure yet)
+[4]    PAN position  (0x5a = 90 at home; 0xae = 174 at full-left)
+[5]    TILT position (0xb4 = 180 at home; stable when only pan moves)
+[6]    0x00 trailer (probably null terminator)
+```
+
+If bytes 4-5 are unsigned 0-255 representing the full pan/tilt range:
+- Pan range 350° / 256 = ~1.367°/unit; full-left swing from 0x5a to 0xae is
+  +84 units ≈ 115°. Full-left from center in a 350° range is ~175° — so
+  either the encoding is signed, or the convention is different from
+  "0=center, 128=full-left".
+- Plausible alternative: signed int8 where 0x5a = +90 (right of center) and
+  0xae = -82 (left of center), making the move a 172° swing. **Consistent
+  with "full left from center".**
+
+### Session 4 (added live): tilt-up confirmation
+
+User left the pan at full-left and tilted the mount fully up via the app.
+Capture:
+
+| Session | State | Raw payload |
+|---|---|---|
+| 4 | full-left, **tilted up** | `03` `4c 0e 7b` `ae` `f1` `00` |
+
+**Byte 5 changed `0xb4` → `0xf1` (180 → 241)** while byte 4 held at `0xae`.
+This confirms byte 5 is the tilt axis. Pan-vs-tilt assignment is now locked.
+
+Tilt range 125° total / 256 byte values = 0.488°/unit. The b4→f1 swing of
++61 units ≈ 30° of tilt, which is less than a "fully up" command should
+produce. Either (a) the byte encoding isn't a linear 0-255 over the full
+range, (b) the encoding is signed and 0xb4 maps to a value far from center,
+or (c) the user's "tilt up" didn't reach the mechanical limit. More
+positions needed to pin the encoding.
+
+### Next steps
+
+1. **Home-reset capture**: user sends Rosie back to home (or uses the app's
+   "Set Home" / "Reset" button if available). Confirms bytes 4-5 return to
+   `0x5a 0xb4` and gives a stable origin for the byte-to-degree mapping.
+2. **Multi-position sweep**: 4-5 captures at different known positions
+   (e.g., full-right + center-tilt, center + tilt-down, etc.) to fit a
+   byte-to-degree curve and resolve signed-vs-unsigned encoding.
+2. **Home-reset confirmation** (single capture): user uses app to send
+   Rosie back to home. Confirm bytes 4-5 return to `0x5a 0xb4`.
+3. **Sample several positions** (3-4 captures at known approximate
+   positions) to figure out the byte-to-degree mapping and signed/unsigned
+   question.
+4. **Then** plan a send-command experiment: build a candidate
+   ACCESSORY_MESSAGE payload (probably mirroring the 7-byte server-push
+   format) and send it via our TLS connection. Confirm with user before
+   doing anything that could trigger physical motion.
+
+Logs (gitignored, kept locally for verification):
+- `logs/immis_observe-1234567-20260519-174446.jsonl` (session 1, home)
+- `logs/immis_observe-1234567-20260519-174558.jsonl` (session 2, home)
+- `logs/immis_observe-1234567-20260519-174717.jsonl` (session 3, full-left)
+
 ## 2026-05-19 — Phase 1 CONCLUDED: REST has no rosie movement controls
 
 After ~85 distinct path/method probes against Blink's REST API, **no
