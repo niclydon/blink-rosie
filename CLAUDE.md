@@ -183,8 +183,20 @@ The user's "Default View" preset at `0x3e` (62) is just left of mechanical
 center, by their choice. Both axes use unsigned bytes with increasing value
 mapping to leftward-pan / upward-tilt.
 
-**The client→server command format is still unknown** — only server-push
-state has been observed. Phase 2.3 will tackle that.
+**The client→server command format is partially known:** Phase 2.3
+established that **0x17 SESSION_COMMAND is the command channel** — only
+message type that produces any server response when sent client→server
+(empty 0x18 ACK within 37ms). 0x14 INLINE_COMMAND and 0x15 ACCESSORY_MESSAGE
+in the client→server direction are both silently ignored by the server.
+
+What we still don't know: the valid Rosie cmd_id values and the exact
+payload shape. The empty 0x18 ACK is universal — the server ACKs every
+0x17 regardless of cmd_id validity, so the ACK can't distinguish valid
+commands from invalid ones. To find the cmd_id without brute-forcing
+hundreds of (cmd_id × payload) combinations while watching the camera,
+**Phase 3 (Android MITM via Frida + mitmproxy + socat) is the practical
+next step** — capture one real pan/tilt command from the Blink app and
+read off the format directly. The setup is in `refs/blink-immis-proxy/`.
 
 The community references (sealad886's TS enum, blinkpy) did not document
 0x06, 0x0c, 0x13, or the bidirectional KEEPALIVE behavior. Original

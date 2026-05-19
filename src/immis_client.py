@@ -115,12 +115,20 @@ LATENCY_STATS_PAYLOAD = bytes(24)
 
 
 class ImmisObserver:
-    """Connect, hold the connection, log everything that isn't VIDEO."""
+    """Connect, hold the connection, log everything that isn't VIDEO.
+    Optionally send a single crafted packet after the setup burst completes."""
 
-    def __init__(self, target: ImmisTarget, log_path: Path, duration_s: float):
+    def __init__(
+        self,
+        target: ImmisTarget,
+        log_path: Path,
+        duration_s: float,
+        send_after_setup: Optional[tuple[int, bytes]] = None,
+    ):
         self.target = target
         self.log_path = log_path
         self.duration_s = duration_s
+        self.send_after_setup = send_after_setup  # (msgtype, payload) or None
         self.reader: Optional[asyncio.StreamReader] = None
         self.writer: Optional[asyncio.StreamWriter] = None
         self.log_fh = None
@@ -129,6 +137,8 @@ class ImmisObserver:
         self.non_video_count = 0
         self.by_type: dict[int, int] = {}
         self.stop_event = asyncio.Event()
+        self.setup_complete_event = asyncio.Event()
+        self.tx_seq_by_type: dict[int, int] = {}
 
     def _log(self, record: dict) -> None:
         record["t"] = round(time.time() - self.t0, 3)
@@ -167,6 +177,8 @@ class ImmisObserver:
                     if self.video_count == 1:
                         sync_ok = bool(payload) and payload[0] == 0x47
                         self._log({"event": "first_video", "len": length, "mpegts_sync": sync_ok})
+                        # First video frame = setup burst is over
+                        self.setup_complete_event.set()
                 else:
                     self.non_video_count += 1
                     name = _name_for(msgtype)
@@ -227,6 +239,27 @@ class ImmisObserver:
             print(f"  duration {self.duration_s}s elapsed — closing")
             self.stop_event.set()
 
+    async def _send_after_setup(self) -> None:
+        if self.send_after_setup is None:
+            return
+        msgtype, payload = self.send_after_setup
+        try:
+            await asyncio.wait_for(self.setup_complete_event.wait(), timeout=10.0)
+        except asyncio.TimeoutError:
+            print(f"  send: setup never completed (no first_video) — sending anyway")
+        await asyncio.sleep(0.3)  # let any final setup-burst packets land
+        assert self.writer is not None
+        self.tx_seq_by_type[msgtype] = self.tx_seq_by_type.get(msgtype, 0) + 1
+        seq = self.tx_seq_by_type[msgtype]
+        pkt = frame(msgtype, seq, payload)
+        name = _name_for(msgtype)
+        print(f"  TX  0x{msgtype:02x} {name:<18} seq={seq} len={len(payload)}  payload={payload.hex()}")
+        self._log({"event": "tx_experiment", "type_hex": f"0x{msgtype:02x}",
+                   "type_name": name, "seq": seq, "len": len(payload),
+                   "hex": payload.hex()})
+        self.writer.write(pkt)
+        await self.writer.drain()
+
     async def run(self) -> None:
         self.t0 = time.time()
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -243,6 +276,8 @@ class ImmisObserver:
                 asyncio.create_task(self._heartbeat_loop(), name="hb"),
                 asyncio.create_task(self._timer(), name="timer"),
             ]
+            if self.send_after_setup is not None:
+                tasks.append(asyncio.create_task(self._send_after_setup(), name="send"))
             await self.stop_event.wait()
             for t in tasks:
                 t.cancel()
@@ -308,6 +343,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     parse_url = sub.add_parser("parse-url", help="parse and dump an immis:// URL without connecting")
     parse_url.add_argument("url")
 
+    snd = sub.add_parser("send", help="open a session, wait for setup, send one crafted packet, then observe")
+    snd.add_argument("--camera-id", type=int, required=True)
+    snd.add_argument("--network-id", type=int, default=12345)
+    snd.add_argument("--msgtype", required=True, help="hex (e.g. 14 for INLINE_COMMAND, 15 for ACCESSORY_MESSAGE)")
+    snd.add_argument("--payload", default="", help="hex-encoded payload (default empty)")
+    snd.add_argument("--duration", type=float, default=15.0, help="how long to hold connection after send")
+
     args = ap.parse_args(argv)
 
     if args.cmd == "parse-url":
@@ -317,6 +359,24 @@ def main(argv: Optional[list[str]] = None) -> int:
             "conn_id": t.conn_id, "serial": t.serial,
             "client_id": t.client_id,
         }, indent=2))
+        return 0
+
+    if args.cmd == "send":
+        msgtype = int(args.msgtype, 16)
+        payload = bytes.fromhex(args.payload) if args.payload else b""
+        print(f"requesting liveview for SEND: owl={args.camera_id} network={args.network_id}")
+        url, command_id, body = _start_liveview(args.camera_id, args.network_id)
+        print(f"  immis url: {url}")
+        print(f"  command_id: {command_id}")
+        print(f"  will send after setup: msgtype=0x{msgtype:02x} ({_name_for(msgtype)}), payload={payload.hex()!r} ({len(payload)} bytes)")
+        target = ImmisTarget.from_url(url)
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        log_path = LOG_DIR / f"immis_send-{args.camera_id}-{ts}.jsonl"
+        obs = ImmisObserver(target, log_path, args.duration, send_after_setup=(msgtype, payload))
+        try:
+            asyncio.run(obs.run())
+        except KeyboardInterrupt:
+            print("interrupted")
         return 0
 
     if args.cmd == "observe":

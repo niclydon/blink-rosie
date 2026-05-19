@@ -12,6 +12,65 @@ Newest at the top. Cite source files / packet captures where applicable.
 - blink-mcp confirmed available on the network for authenticated REST access.
 - Reference repos cloned into `refs/` (not vendored — see `.gitignore`).
 
+## 2026-05-19 — Phase 2.3: identified the command channel (0x17), but format still unknown
+
+Added a `send` subcommand to `immis_client.py` (opens session, waits for
+setup burst, sends one configured packet, holds connection to observe
+reactions). Used it to probe three candidate client→server message types.
+
+**Probe results:**
+
+| Probe | TX | TX payload | Server reaction | Camera moved? |
+|---|---|---|---|---|
+| A | 0x14 INLINE_COMMAND | (empty) | none | no |
+| B | 0x14 INLINE_COMMAND | `00000000 70 77 00` (7-byte echo of server format, target pan 0x70) | none | no |
+| C | 0x14 INLINE_COMMAND | `01 5a b4` (cmd-id-prefix style) | none | no |
+| D | 0x17 SESSION_COMMAND | `05 5a b4` (cmd_id=5, pan, tilt) | **empty 0x18 SESSION_MESSAGE @ t+37ms** | no |
+| E | 0x15 ACCESSORY_MESSAGE | `00000000 70 b4 00` (7-byte echo with target) | none | no |
+| F | 0x17 SESSION_COMMAND | `ff` (invalid cmd_id only) | **empty 0x18 SESSION_MESSAGE @ t+~30ms** | no |
+
+**Key findings:**
+
+1. **0x17 SESSION_COMMAND is the command channel.** Only message type that
+   produces any server reaction. 37ms response time matches network RTT —
+   the server is reading and processing our 0x17 packets immediately.
+2. **0x14 INLINE_COMMAND (sent direction) is dead silent.** Despite Blink
+   app's `IMMI_DATA_FLAG_INLINE_LV_CMD` (sent counter) hint suggesting
+   otherwise, our 0x14 sends produce zero server reaction. Either the
+   message type was renamed/deprecated, or we're missing something the
+   app populates that gates 0x14 processing.
+3. **0x15 ACCESSORY_MESSAGE in client→server direction is also ignored.**
+   Despite being marked "bidirectional" in community refs, our 0x15 sends
+   get no response. The server-push direction works; client→server seems
+   to be inert.
+4. **The empty 0x18 ACK is universal, not content-dependent.** Sending
+   cmd_id=`0xff` (clearly bogus) produced the same empty ACK as cmd_id=
+   `0x05`. The server ACKs every 0x17 it receives at the protocol layer,
+   then silently discards unrecognized cmd_ids/payloads. So **we can't use
+   ACK content to determine if a command was understood** — only physical
+   movement or a follow-up ACCESSORY_MESSAGE will tell us.
+
+**What we can't determine via local experimentation:**
+
+- The valid Rosie cmd_id values (audio cmd_ids 3, 4 are known; movement
+  cmd_id is unknown — could be 5, 6, 7, 8, 0x10, anything)
+- The expected payload format (just `cmd_id`? `cmd_id + pan + tilt`?
+  `cmd_id + 7-byte ACCESSORY_MESSAGE shape`? `cmd_id + accessory_id + …`?)
+- Whether there are additional auth/permission requirements that gate
+  command execution
+
+**Why brute-force is impractical:** without command-success signal, we'd
+need to test every (cmd_id × payload-shape) combination AND watch the
+camera physically for each one. Even narrowing cmd_ids to 0x00-0x1f and 3
+payload shapes = ~96 probes, each ~20s, each requiring eyes-on-mount.
+
+**Next step: Phase 3 — Android MITM.** Captures one real pan/tilt command
+from the actual Blink app. Setup is documented in
+`refs/blink-immis-proxy/proxy.py` (mitmproxy + socat) and
+`refs/blink-immis-proxy/inject-tls-verify-hook.py` (Frida hook to bypass
+libwalnut TLS cert pinning). Needs a rooted Android device or Bliss OS in
+QEMU. Multi-hour setup, but yields ground truth in one capture.
+
 ## 2026-05-19 — Phase 2.2 BREAKTHROUGH: wire-format candidate for Rosie position state
 
 **Built `src/immis_client.py`** — async TLS client that connects to a live
