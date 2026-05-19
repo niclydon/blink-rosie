@@ -12,6 +12,95 @@ Newest at the top. Cite source files / packet captures where applicable.
 - blink-mcp confirmed available on the network for authenticated REST access.
 - Reference repos cloned into `refs/` (not vendored — see `.gitignore`).
 
+## 2026-05-19 — Phase 1 CONCLUDED: REST has no rosie movement controls
+
+After ~85 distinct path/method probes against Blink's REST API, **no
+controller exists for rosie pan/tilt control**. Every probe outside the known
+homescreen/config/liveview routes returned the generic nginx + Phusion
+Passenger `<h1>Not Found</h1>` HTML — meaning Blink's Rails router has no
+entry for any of these paths.
+
+**Probes performed (all HTML 404):**
+
+| Group | Method | Count |
+|---|---|---|
+| `/networks/{n}/cameras/{c}/accessories/rosie/{r}{suffix}` (16 suffixes) | GET | 16 |
+| `/networks/{n}/owls/{c}/accessories/rosie/{r}{suffix}` (16 suffixes) | GET | 16 |
+| Account-/network-scoped /accessories variants | GET | 5 |
+| Legacy `/network/{n}/(owl\|camera)/{c}/...` shape | GET | 2 |
+| Same 39 paths via POST `{}` | POST | 39 |
+| Rosie-as-direct-subresource (`/owls/{c}/rosie/...`) | GET/POST | 5 |
+| Alternate API versions (`/api/v2`, `/api/v4`) | GET | 2 |
+
+**Liveview response inspection** (`POST /api/v2/accounts/{a}/networks/{n}/owls/{c}/liveview`):
+
+```json
+{
+  "command_id": 2214879929,
+  "duration": 300,
+  "extended_duration": 5400,
+  "polling_interval": 15,
+  "is_mclv": true,
+  "server": "immis://<aws-relay-ip>:443/{ConnectionID}__IMDS_{DeviceSerial}?client_id={ClientID}",
+  ...
+}
+```
+
+No rosie-specific fields. The mobile app must be discovering pan/tilt
+capability from the homescreen `accessories.rosie[]` array (where `calibrated:
+true` and `connected: true` enable the UI), then sending movement commands
+in-band on the IMMIS connection — exactly as CLAUDE.md hypothesized.
+
+**Other facts captured during Phase 1:**
+
+- `POST /network/{n}/command/{cmd_id}/done` is deprecated:
+  `{"message":"Endpoint no longer supported.","code":900}`. Liveview commands
+  auto-expire on Blink's side when no IMMIS client connects (we saw
+  `status_code: 523, status_msg: "Live view failed"` after our test session
+  was abandoned). Phase 2 doesn't need to manage this lifecycle.
+- IMMIS URL is a real string from production: `immis://{IP}:443/{ConnID}__IMDS_{DeviceSerial}?client_id={CameraID}`.
+  ClientID parameter == camera ID (the owl_id, `1234567`), which fits as uint32
+  in the 122-byte auth header at offset 24.
+- DeviceSerial in the URL (`GNTXXXXXXXXXXXXX`) is 16 chars and gets dropped
+  into the auth header's serial field at offset 8.
+
+**Verdict:** Phase 1 done. REST is conclusively dead for rosie control.
+Pivot to Phase 2 (build IMMIS client, fuzz ACCESSORY_MESSAGE 0x15 and
+INLINE_COMMAND 0x14 payloads).
+
+Logs:
+- `logs/rosie_probe-get-20260519-171113.jsonl` (39 GET probes)
+- `logs/rosie_probe-post-20260519-171729.jsonl` (39 POST probes)
+
+## 2026-05-19 — Phase 1a GET sweep + verb-discriminator diagnostic
+
+**Result:** 39/39 candidate GETs returned `404 <h1>Not Found</h1>` (generic
+nginx + Phusion Passenger HTML). No rate limiting, ~120-150ms per request.
+
+**Diagnostic followup** revealed that the GET sweep is less conclusive than it
+looks. Blink returns the same generic HTML 404 for "no route matches" AND for
+"route exists for a different verb." The differentiator is what the response
+looks like when the *controller* fires:
+
+| Probe | Response | What it tells us |
+|---|---|---|
+| `GET /api/v3/accounts/{acct}/homescreen` | `200 application/json` | route + controller live |
+| `GET /api/v3/accounts/{wrong}/homescreen` | `400 {"code":1620,"message":"Invalid Account ID"}` | route matched, controller validated and rejected |
+| `GET /api/v3/accounts/{acct}/garbage_suffix` | `404 text/html <h1>Not Found</h1>` | no route at all |
+| `GET /api/v1/accounts/{acct}/networks/12345/state/arm` (POST-only route) | `404 text/html <h1>Not Found</h1>` | **same HTML 404 as no-route** |
+| `POST /api/v1/accounts/{acct}/networks/12345/state/nonsense` | `400 {"message":"Arm or Disarm are only valid states"}` | route matched on POST, validator ran |
+| `PUT /api/v3/accounts/{acct}/homescreen` (GET-only) | `404 text/html <h1>Not Found</h1>` | wrong verb → HTML 404 |
+
+**Implication:** the 39-path GET sweep does NOT rule out POST-only rosie
+controllers. Some of the 39 paths might be live POST endpoints that 404 on GET
+identically to a non-existent route. To actually rule out rosie REST control,
+we need a POST sweep with empty `{}` payload — controllers running their
+validators on empty input will surface as JSON 4xx (e.g. `{"message":"missing
+field 'direction'"}`) rather than HTML 404.
+
+**Status:** GET sweep complete; POST sweep is the next probe.
+Log: `logs/rosie_probe-get-20260519-171113.jsonl` (39 entries, all 404 HTML).
+
 ## 2026-05-19 — Inherited from blink-mcp
 
 Read through `~/projects/blink-mcp` (the production MCP service for this account).
