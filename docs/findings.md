@@ -12,6 +12,161 @@ Newest at the top. Cite source files / packet captures where applicable.
 - blink-mcp confirmed available on the network for authenticated REST access.
 - Reference repos cloned into `refs/` (not vendored — see `.gitignore`).
 
+## 2026-05-19 — Phase 3 (libwalnut.so analysis): wire format decoded from disassembly
+
+Pivoted from iOS class-dump (user has no IPA, no jailbroken phone) to
+Android APK static analysis on Furnace.
+
+**APK source:** Blink 55.1 (`com.immediasemi.android.blink_55.1-29635039`)
+pulled from APKMirror via the user's MacBook (also kept 54.1 alongside for
+potential diff). Unpacked the `.apkm` bundle and extracted
+`lib/arm64-v8a/libwalnut.so` (~25 MB, ELF aarch64).
+
+**The binary is unstripped with debug info.** GNU build ID
+`ef4234b958fe83bb`. 3260 exported symbols, 11776 total. JNI exports are
+under `Java_com_immediasemi_walnut_*` (the Android name for what the iOS
+brief called the "WalnutPlayer" framework).
+
+**Source paths leaked via debug info:**
+```
+/walnut/android/externals/MbedTLS/third-party-src/library/...
+/walnut/android/src/.../IMMIStreamSource.cc:399  ← submitInlineLVCommand
+/walnut/android/src/.../IMMIStreamSource.cc:510  ← processInlineLVCommandPayload
+```
+
+**Critical log-string finds (from `strings -n 6`):**
+
+| String | Tells us |
+|---|---|
+| `"Attempted to send inline LV command of incorrect type: type = %d"` | The `type` arg is whitelisted; wrong values silently fail with this log |
+| `"submitInlineLVCommand called before StreamSource has been initialized"` | StreamSource must be initialized before commands accepted |
+| `"Inline LV command received while not in a Streaming state"` | Bidirectional — server sends 0x14 too, but only during streaming |
+| `"Received inline LV command from stream - command = '%zu', payload size = %u"` | Receive log shows the format: `command` is a size_t, payload has its own size |
+| `"IMMI_DATA_FLAG_INLINE_LV_CMD"` | The data-flag name, confirms 0x14 = InlineLVCommand |
+
+**No "rosie", "accessory", "pan", or "tilt" strings appear in
+`libwalnut.so`.** The Rosie pan-tilt is NOT a named abstraction in the
+walnut protocol library — it's just a specific (type, command) tuple in
+the generic InlineLVCommand framework.
+
+**Function signature (demangled from C++ mangled symbol):**
+
+```cpp
+walnut::IMMIStreamSource::submitInlineLVCommand(
+    unsigned char type,
+    unsigned int  command,
+    const std::vector<unsigned char>& payload
+)
+```
+
+### Send-side: type validation
+
+Disassembled `walnut::IMMIStreamSource::submitInlineLVCommand` at virtual
+address `0x17084c` (size 412 bytes). The prologue does:
+
+```asm
+; load state byte from `this`
+0x17085c   ldr  w8, [x0, 0xc7]
+0x170860   and  w8, w8, 0xfffffffe   ; mask low bit
+0x170864   cmp  w8, 4                 ; state == initialized?
+0x170868   b.ne 0x170890              ; → "called before initialized" log
+
+; validate `type` arg
+0x17086c   and  w8, w1, 0xff          ; w1 = type
+0x170870   cmp  w8, 0x14              ; type == INLINE_COMMAND?
+0x170874   b.eq 0x170880              ; yes → continue
+0x170878   cmp  w8, 0x17              ; type == SESSION_COMMAND?
+0x17087c   b.ne 0x170904              ; no → "incorrect type" log
+
+; success path: tail-call to wire-write
+0x170880-88   (restore regs)
+0x17088c   b   0x1d2380               ; PLT trampoline to wire-send fn
+```
+
+**Only `type == 0x14` (INLINE_COMMAND) or `type == 0x17` (SESSION_COMMAND)
+are accepted as the first argument.** Other values silently fail with the
+"incorrect type" log message. This explains why our 0x14 and 0x17 send
+experiments earlier produced varying server reactions — but neither
+properly framed the body.
+
+### Receive-side: body layout
+
+Disassembled `processInlineLVCommandPayload()` at `0x170ae4`. The packet
+body is parsed as:
+
+```asm
+0x170afc   add  x9, x8, 0x311           ; ptr to offset 0x311 in `this`
+0x170b00   ldrb w10, [x8, 0x310]        ; load type byte (offset 0x310)
+0x170b08   ldr  w9, [x9]                 ; load uint32 at offset 0x311
+0x170b1c   add  x3, x8, 0x315            ; payload starts at offset 0x315
+0x170b20   rev  w9, w9                   ; **big-endian byte-swap the command!**
+0x170b28   blr  x10                      ; invoke callback(type, command, payload)
+```
+
+**This nails down the on-wire body layout of every 0x14/0x17 packet:**
+
+```
+9-byte IMMIS header:
+  [byte 0]      msgtype: 0x14 (INLINE_COMMAND) or 0x17 (SESSION_COMMAND)
+  [bytes 1-4]   seq (uint32, big-endian)
+  [bytes 5-8]   length (uint32, big-endian) — counts bytes from this point
+
+Packet body (length bytes):
+  [byte 0]      type      — 0x14 or 0x17, matches outer msgtype
+  [bytes 1-4]   command   — uint32 BIG-ENDIAN (CONFIRMED by `rev w9, w9`)
+  [bytes 5...]  payload   — variable-length payload bytes
+```
+
+So a proper INLINE_COMMAND that calls `submitInlineLVCommand(type=0x14, command=N, payload=[...])` produces on the wire:
+
+```
+14  <seq:4 BE>  <length:4 BE>  14  <N:4 BE>  <payload bytes>
+```
+
+Total IMMIS packet size = 9 + 5 + payload.size() bytes.
+
+### Why our earlier Phase 2.3 probes silently failed
+
+| Probe | Outer msgtype | Body bytes | Body parsed as |
+|---|---|---|---|
+| A: empty | 0x14 | (none) | length=0, but parser expects ≥5; underrun → silent discard |
+| B: `00000000 70 77 00` | 0x14 | 7 bytes | type=0x00 ← invalid (≠0x14/0x17) → "incorrect type" log |
+| C: `01 5a b4` | 0x14 | 3 bytes | type=0x01 invalid + underrun for command |
+| D: `05 5a b4` | 0x17 | 3 bytes | type=0x05 invalid + underrun for command |
+| E: `00000000 70 b4 00` | 0x15 | 7 bytes | wrong outer msgtype — 0x15 isn't routed to this handler at all |
+| F: `ff` | 0x17 | 1 byte | type=0xff invalid + underrun |
+
+The "empty 0x18 ACK within 37ms" we saw for probes D and F is therefore
+**not a content-level ACK from the InlineLVCommand layer** — it's
+something else in the IMMIS framing layer (possibly a connection-level
+keepalive nudge triggered by any received 0x17 packet, before the body
+parser even runs).
+
+### What's still needed
+
+The wire format is fully known. What remains unknown is the **valid
+`command` (uint32) values for Rosie movement**. The walnut.so binary
+itself contains no string constants like "rosie_pan" or "tilt_set" — the
+cmd_id integers come from the Kotlin/Java app layer, which lives in
+`base.apk`'s `classes.dex` and would need `jadx` or `apktool` to decompile.
+
+Two next-step options:
+
+1. **Decompile `classes.dex`** with `jadx` (no Java needed for jadx-cli;
+   ~80MB download). Find call sites of `Player.submitInlineLVCommand(...)`
+   in the Kotlin code. Those calls pass concrete `type` and `command`
+   values — the rosie/pan-tilt ones will be in business-logic classes
+   adjacent to live-view UI code.
+2. **Brute-force `command` with the correct body shape now**. Since we
+   know the wire format, we can iterate cmd_ids 0..0x40 with body=`[type,
+   cmd_BE_uint32, pan, tilt]` and watch for movement or for the
+   server-pushed ACCESSORY_MESSAGE position update. Each probe is well-
+   formed instead of silently discarded.
+
+Recommended: try a small handful of likely cmd_ids first with the correct
+body shape (4-5 probes), then if no movement, pivot to jadx for definitive
+identification.
+
 ## 2026-05-19 — Phase 2.3: identified the command channel (0x17), but format still unknown
 
 Added a `send` subcommand to `immis_client.py` (opens session, waits for

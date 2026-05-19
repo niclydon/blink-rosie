@@ -183,20 +183,50 @@ The user's "Default View" preset at `0x3e` (62) is just left of mechanical
 center, by their choice. Both axes use unsigned bytes with increasing value
 mapping to leftward-pan / upward-tilt.
 
-**The client→server command format is partially known:** Phase 2.3
-established that **0x17 SESSION_COMMAND is the command channel** — only
-message type that produces any server response when sent client→server
-(empty 0x18 ACK within 37ms). 0x14 INLINE_COMMAND and 0x15 ACCESSORY_MESSAGE
-in the client→server direction are both silently ignored by the server.
+**The client→server wire format IS now known** — decoded from
+disassembling `libwalnut.so` (Blink Android app native library, unstripped
+with debug info) on 2026-05-19. The `walnut::IMMIStreamSource::submitInlineLVCommand`
+function (at virtual address `0x17084c` in v55.1) takes:
 
-What we still don't know: the valid Rosie cmd_id values and the exact
-payload shape. The empty 0x18 ACK is universal — the server ACKs every
-0x17 regardless of cmd_id validity, so the ACK can't distinguish valid
-commands from invalid ones. To find the cmd_id without brute-forcing
-hundreds of (cmd_id × payload) combinations while watching the camera,
-**Phase 3 (Android MITM via Frida + mitmproxy + socat) is the practical
-next step** — capture one real pan/tilt command from the Blink app and
-read off the format directly. The setup is in `refs/blink-immis-proxy/`.
+```cpp
+submitInlineLVCommand(unsigned char type, unsigned int command,
+                      const std::vector<unsigned char>& payload)
+```
+
+It validates `type` against a 2-value whitelist (`0x14` or `0x17`) and
+silently drops anything else with the log `"Attempted to send inline LV
+command of incorrect type"`. The receive-side disassembly of
+`processInlineLVCommandPayload()` revealed the on-wire body layout:
+
+```
+9-byte IMMIS header:
+  [byte 0]      msgtype: 0x14 INLINE_COMMAND or 0x17 SESSION_COMMAND
+  [bytes 1-4]   seq (uint32 BE)
+  [bytes 5-8]   length (uint32 BE) — body bytes that follow
+
+Packet body (length bytes total):
+  [byte 0]      type       — 0x14 or 0x17, matches outer msgtype
+  [bytes 1-4]   command    — uint32 BIG-ENDIAN (the cmd_id)
+  [bytes 5...]  payload    — variable-length payload bytes
+```
+
+The `rev w9, w9` instruction in the receive parser confirms big-endian
+encoding for the `command` field. Total packet size on the wire =
+9 + 5 + payload.size() bytes.
+
+**Why our earlier Phase 2.3 probes silently failed:** none of them framed
+the body correctly. The first byte of the body must be the type
+(`0x14` or `0x17` again), then the 4-byte big-endian command, then payload.
+Probe D's body `055ab4` parsed as: type=`0x05` (invalid → silent discard
+with "incorrect type" log).
+
+**What's still unknown:** the valid `command` (uint32) values for Rosie
+movement. The walnut.so binary itself has no string constants like
+"rosie_pan" or "tilt_set" — the integer cmd_ids come from the Kotlin/Java
+app layer in `base.apk` (`classes.dex`), which needs `jadx` or `apktool`
+to decompile. Alternative: brute-force `command` 0..0x40 with the correct
+body shape now that the framing is known — each probe will be parsed
+properly instead of silently discarded.
 
 The community references (sealad886's TS enum, blinkpy) did not document
 0x06, 0x0c, 0x13, or the bidirectional KEEPALIVE behavior. Original

@@ -1,6 +1,12 @@
 # Reference repos — cloned locally, not vendored
 refs/
 
+# Blink APK extraction workspace — 100+ MB binaries, not vendored
+blink-apk-staging/
+*.apk
+*.apkm
+*.aab
+
 # Captured artifacts that may contain account IDs, serials, tokens
 logs/
 *.pcap
