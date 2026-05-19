@@ -1,0 +1,44 @@
+# Reference repos — cloned locally, not vendored
+refs/
+
+# Captured artifacts that may contain account IDs, serials, tokens
+logs/
+*.pcap
+*.pcapng
+*.har
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node
+node_modules/
+dist/
+
+# Go
+*.test
+*.out
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Secrets
+.env
+.env.*
+!.env.example
+*credentials*.json
+tokens.json
+tokens-mcp.json
+
+# Remember plugin internals
+.remember/logs/
+.remember/tmp/
