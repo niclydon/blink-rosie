@@ -55,9 +55,10 @@ class ImmisTarget:
     conn_id: str
     serial: str
     client_id: int
+    auth_token: bytes = b""  # populates the 64-byte token slot in the auth header
 
     @classmethod
-    def from_url(cls, url: str) -> "ImmisTarget":
+    def from_url(cls, url: str, auth_token: bytes = b"") -> "ImmisTarget":
         p = urlparse(url)
         if p.scheme != "immis":
             raise ValueError(f"expected immis://, got {p.scheme}://")
@@ -76,6 +77,7 @@ class ImmisTarget:
             conn_id=conn_id,
             serial=serial,
             client_id=int(client_id_q),
+            auth_token=auth_token,
         )
 
 
@@ -88,7 +90,8 @@ def build_auth_header(target: ImmisTarget) -> bytes:
     buf.extend(target.client_id.to_bytes(4, "big"))
     buf.extend(b"\x01\x08")  # static
     buf.extend(TOKEN_LEN.to_bytes(4, "big"))
-    buf.extend(b"\x00" * TOKEN_LEN)  # null auth token (matches all known clients)
+    token = target.auth_token[:TOKEN_LEN].ljust(TOKEN_LEN, b"\x00")
+    buf.extend(token)
     buf.extend(CONN_ID_LEN.to_bytes(4, "big"))
     buf.extend(target.conn_id.encode("utf-8")[:CONN_ID_LEN].ljust(CONN_ID_LEN, b"\x00"))
     buf.extend(b"\x00\x00\x00\x01")  # trailer
@@ -281,14 +284,14 @@ def _name_for(msgtype: int) -> str:
         return f"UNKNOWN_0x{msgtype:02x}"
 
 
-def _start_liveview(camera_id: int, network_id: int) -> tuple[str, int]:
-    """POST /liveview, return (immis_url, command_id)."""
+def _start_liveview(camera_id: int, network_id: int) -> tuple[str, int, dict]:
+    """POST /liveview, return (immis_url, command_id, full_response)."""
     c = BlinkClient()
     path = f"/api/v2/accounts/{c.session.account_id}/networks/{network_id}/owls/{camera_id}/liveview"
     res = c.request("POST", path, body={"intent": "liveview"})
     if not res.body or "server" not in res.body:
         raise RuntimeError(f"liveview response missing 'server': {res.body!r}")
-    return res.body["server"], res.body.get("command_id", 0)
+    return res.body["server"], res.body.get("command_id", 0), res.body
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -299,6 +302,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     obs.add_argument("--camera-id", type=int, required=True, help="owl id (e.g. 1234567 for LivingRoom)")
     obs.add_argument("--network-id", type=int, default=12345)
     obs.add_argument("--duration", type=float, default=30.0, help="how long to hold the connection (s)")
+    obs.add_argument("--token-source", choices=("null", "player_transaction", "liveview_token", "both"), default="null",
+                     help="what to put in the 64-byte auth-header token slot")
 
     parse_url = sub.add_parser("parse-url", help="parse and dump an immis:// URL without connecting")
     parse_url.add_argument("url")
@@ -316,10 +321,23 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if args.cmd == "observe":
         print(f"requesting liveview: owl={args.camera_id} network={args.network_id}")
-        url, command_id = _start_liveview(args.camera_id, args.network_id)
+        url, command_id, body = _start_liveview(args.camera_id, args.network_id)
         print(f"  immis url: {url}")
         print(f"  command_id: {command_id}")
-        target = ImmisTarget.from_url(url)
+        player_tx = (body.get("player_transaction") or "").encode("utf-8")
+        lv_token = (body.get("liveview_token") or "").encode("utf-8")
+        if args.token_source == "null":
+            auth_token = b""
+        elif args.token_source == "player_transaction":
+            auth_token = player_tx
+        elif args.token_source == "liveview_token":
+            auth_token = lv_token
+        elif args.token_source == "both":
+            auth_token = player_tx + b"\x00" + lv_token
+        else:
+            auth_token = b""
+        print(f"  token-source: {args.token_source} ({len(auth_token)} bytes into 64-byte slot)")
+        target = ImmisTarget.from_url(url, auth_token=auth_token)
         ts = time.strftime("%Y%m%d-%H%M%S")
         log_path = LOG_DIR / f"immis_observe-{args.camera_id}-{ts}.jsonl"
         obs = ImmisObserver(target, log_path, args.duration)

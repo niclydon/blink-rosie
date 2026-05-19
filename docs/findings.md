@@ -124,6 +124,83 @@ If bytes 4-5 are unsigned 0-255 representing the full pan/tilt range:
   0xae = -82 (left of center), making the move a 172° swing. **Consistent
   with "full left from center".**
 
+### Sessions 6-9: post-reboot recovery period (false-alarm investigation)
+
+After session 5, the user unplugged and restarted the LivingRoom camera. The
+next three liveview attempts (sessions 6-8) and one more after extended wait
+(session 9) all failed identically:
+
+- TLS connect succeeded
+- Auth header sent (122 bytes, same as working sessions)
+- 0x06 auth-ACK received from server
+- Keepalive ping/pong worked (server echoed our seq=1, seq=2)
+- **No setup burst, no SESSION_MESSAGE, no 0x0c, no 0x13, no ACCESSORY_MESSAGE, no VIDEO**
+- by_type summary on those sessions: `{"0x06": 1, "0x0a": 2}` — only auth ACK + keepalives
+
+Camera homescreen and `/owls/{id}/config` both showed healthy state during
+these failures (`status: online`, `rosie.connected: true`,
+`rosie.calibrated: true`). The camera's own firmware: `9.96`; the Rosie's
+own firmware (newly visible in config): `1.11.0.2`.
+
+Investigated two hypotheses:
+1. **Auth-header token theory** — Blink might have started requiring the
+   /liveview response's `player_transaction` (16 chars) in the 64-byte token
+   slot of the auth header, where we send all-nulls. Modified
+   `immis_client.py` to support `--token-source player_transaction`.
+2. **Camera-side post-reboot settling time** — camera needed longer to
+   fully reattach the Rosie and resume normal session handling.
+
+**Session 10 resolved it: hypothesis 2 was correct.** When session 10 ran
+with `--token-source player_transaction`, the `/liveview` response that turn
+happened to OMIT `player_transaction` entirely, so we ended up sending the
+same all-null token we'd been sending all along — and the session worked
+fully. The auth header was never the blocker. It was just camera-side state
+needing time. The recovery feature in immis_client.py is left in place for
+future experimentation, but the all-null token continues to work today.
+
+Useful incidental finding: the `player_transaction` field is NOT always
+present in `/liveview` responses — it appeared in our earlier diagnostic
+call but was missing in session 10's response. So we can't rely on it as a
+mandatory authentication factor.
+
+### Session 10: full-RIGHT pan anchors the encoding
+
+Camera at full pan-right (via the Blink app), tilt unchanged:
+
+| Session | State | Raw payload |
+|---|---|---|
+| 10 | **full RIGHT** | `01` `b1 5f 21` `06` `b4` `00` |
+
+**Byte 4 (PAN) = `0x06` (6)** — anchors the LOW end of the pan-byte range.
+**Byte 5 (TILT) = `0xb4` (180)** — matches Default View tilt, consistent.
+
+**Pan encoding now characterized:**
+
+```
+full RIGHT ← 0x06 (6) ── 0x3e (62) ── 0x5a (90) ── 0xae (174) → full LEFT
+                       Default View   earlier      "full left"
+                                       user pos    via app
+```
+
+- Convention: **unsigned, increasing value = leftward pan**
+- Observed range: `0x06` to `0xae` ≈ 168 byte values
+- If Rosie's mechanical pan range is the documented 350°, that's
+  ~2.08°/unit resolution
+- "Default View" at 0x3e sits ~33% of the way from right limit to left
+  limit — consistent with a user-chosen "look slightly left of center"
+  preset, not the mathematical center
+
+Tilt encoding is still under-constrained — we only have two values: `0xb4`
+(at rest, both user-default and pre-experiments) and `0xf1` (~30° up from
+default). Need a full-down capture (and ideally a full-up that's actually
+at the mechanical limit) to pin tilt.
+
+Byte 0 came back as `0x01` again — earlier I'd theorized it was a session
+counter, but it's now appeared as 00, 01, 01, 02, 03 across sessions
+1, 2, 5, 3, 4 in time order. Definitely not a simple counter. Possibly a
+"state-change category" code (e.g., 00 = initial, 01 = single-axis,
+02 = multi-axis?). Insufficient data to determine.
+
 ### Session 5: user-configured "Default View" position
 
 User pressed the Blink app's "Default View" button. **Critical caveat from
