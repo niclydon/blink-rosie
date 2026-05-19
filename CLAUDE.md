@@ -168,11 +168,20 @@ Range: 122 byte values over the documented 125° tilt range → **~1.025°/byte*
 (essentially 1°/byte). Tilt has higher byte-resolution than pan.
 Convention: byte VALUE increases as the mount tilts UPWARD.
 
-**The `0x5a` puzzle:** sessions 1 & 2 (before any deliberate movement) and
-session 11 (after a camera power-cycle) all showed pan byte `0x5a` (90).
-Could be the Rosie's post-boot default, or coincidence. Tilt center is
-proven mechanically central (symmetric deltas); pan center is not
-established — the user's "Default View" preset is `0x3e`, not `0x5a`.
+**Canonical home position: `0x5a 0xb4`.** User confirmed the mount visibly
+returns to "a middle spot" on power-cycle, which matches all three captures
+that came back to `0x5a` (sessions 1, 2, and 11 — all post-boot or
+post-rest). Both axes are now confirmed symmetric around their mechanical
+centers, and the byte-to-degree math closes cleanly:
+
+| Axis | Center | Min byte (right/down) | Max byte (left/up) | Total range | °/byte |
+|---|---|---|---|---|---|
+| Pan  | `0x5a` (90)  | `0x06` (6)   | `0xae` (174) | 168 | 350°/168 ≈ **2.08°/byte** |
+| Tilt | `0xb4` (180) | `0x77` (119) | `0xf1` (241) | 122 | 125°/122 ≈ **1.025°/byte** |
+
+The user's "Default View" preset at `0x3e` (62) is just left of mechanical
+center, by their choice. Both axes use unsigned bytes with increasing value
+mapping to leftward-pan / upward-tilt.
 
 **The client→server command format is still unknown** — only server-push
 state has been observed. Phase 2.3 will tackle that.

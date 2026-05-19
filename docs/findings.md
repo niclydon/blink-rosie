@@ -152,14 +152,24 @@ documented 125° tilt range → **~1.025°/byte (essentially 1°/byte)**.
 This contrasts with pan, which spans ~168 byte values for a documented 350°
 range (~2.08°/byte). Tilt has noticeably higher byte-resolution.
 
-**Pan byte surprise in this session: `0x5a` (90)**. The previous session
-(10) had pan at `0x06` (full right). Between sessions 10 and 11, the camera
-was power-cycled twice during the user's app-troubleshooting episode. The
-pan came back to `0x5a` — which is exactly the value we saw in sessions 1-2
-("the position the camera was in when we first started"). So either the
-user happened to re-center the pan in the app before tilting down, OR
-**`0x5a` is the Rosie's post-boot default pan position**. We don't have
-enough data to distinguish.
+**Pan byte surprise in this session: `0x5a` (90)** — and the user later
+confirmed visually that the camera "did seem to reset to a middle spot when
+it power cycled." That matches sessions 1, 2, and 11 all reading `0x5a`,
+and it lets us close the encoding math:
+
+**Pan is symmetric around `0x5a`:**
+- Right limit at `0x06` (delta -84)
+- Mechanical center / power-on default at `0x5a`
+- Left limit at `0xae` (delta +84)
+- Range = 168 byte values → 350° / 168 = **2.08°/byte**
+
+**Tilt is symmetric around `0xb4`** (already characterized):
+- Down limit `0x77` (delta -61), center `0xb4`, up limit `0xf1` (delta +61)
+- Range = 122 byte values → 125° / 122 = **1.025°/byte**
+
+The **canonical home position** (mechanical centers, post-boot default) is
+**pan=`0x5a` tilt=`0xb4`**. The user's "Default View" preset at `0x3e b4`
+is slightly left of mechanical center, set by user preference.
 
 **Byte 0 ("counter") theory definitively dead.** Across all 6 successful
 captures, byte 0 values were: `00, 01, 02, 03, 01, 01, 00` (in session
