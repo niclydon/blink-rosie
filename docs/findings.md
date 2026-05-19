@@ -124,6 +124,50 @@ If bytes 4-5 are unsigned 0-255 representing the full pan/tilt range:
   0xae = -82 (left of center), making the move a 172° swing. **Consistent
   with "full left from center".**
 
+### Session 11: tilt-DOWN anchors tilt encoding (and is symmetric)
+
+User power-cycled the camera (second restart), then tilted the mount fully
+down via the app. Capture worked first try — no recovery delay this time
+(camera had been off for several minutes during user-driven app
+troubleshooting before being plugged back in).
+
+| Session | State | Raw payload |
+|---|---|---|
+| 11 | tilt fully DOWN | `00` `79 92 d1` `5a` `77` `00` |
+
+**Byte 5 (TILT) = `0x77` (119)** — anchors the LOW end of the tilt range.
+
+**Tilt encoding now characterized — and it's symmetric around `0xb4`:**
+
+| Position | Tilt byte | Delta from rest |
+|---|---|---|
+| fully DOWN (session 11) | `0x77` (119) | -61 |
+| at rest (sessions 1, 2, 5, 10) | `0xb4` (180) | 0 |
+| fully UP (session 4) | `0xf1` (241) | +61 |
+
+The deltas are equal in both directions. **0xb4 is the mechanical center**
+of tilt. Full range = 0x77 to 0xf1 = 122 byte values mapped to the
+documented 125° tilt range → **~1.025°/byte (essentially 1°/byte)**.
+
+This contrasts with pan, which spans ~168 byte values for a documented 350°
+range (~2.08°/byte). Tilt has noticeably higher byte-resolution.
+
+**Pan byte surprise in this session: `0x5a` (90)**. The previous session
+(10) had pan at `0x06` (full right). Between sessions 10 and 11, the camera
+was power-cycled twice during the user's app-troubleshooting episode. The
+pan came back to `0x5a` — which is exactly the value we saw in sessions 1-2
+("the position the camera was in when we first started"). So either the
+user happened to re-center the pan in the app before tilting down, OR
+**`0x5a` is the Rosie's post-boot default pan position**. We don't have
+enough data to distinguish.
+
+**Byte 0 ("counter") theory definitively dead.** Across all 6 successful
+captures, byte 0 values were: `00, 01, 02, 03, 01, 01, 00` (in session
+order 1, 2, 3, 4, 5, 10, 11). Not a counter. Not monotonic. Could be:
+- A state-change-type code that takes a small set of discrete values
+- A flag bitmask we're not interpreting correctly
+- A randomly-set field that happens to use low values
+
 ### Sessions 6-9: post-reboot recovery period (false-alarm investigation)
 
 After session 5, the user unplugged and restarted the LivingRoom camera. The

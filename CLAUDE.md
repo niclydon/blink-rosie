@@ -132,22 +132,50 @@ changes. Hypothesis: **per-rosie identity / device class hash**.
 ```
 
 **7-byte packet (seq=2)** — the **current Rosie position snapshot**.
-Confirmed by panning the mount full-left (byte 4 changes) and tilting up
-(byte 5 changes):
+Format characterized across 7 live captures with deliberate movement:
 
 ```
-[0]    state-version counter (00 → 01 → 02 → ... increments each session/state-update)
+[0]    NOT a counter (values 00/01/02/03 seen, non-monotonic) — possibly state-change code
 [1-3]  state-change hash or timestamp (variable, no clear structure yet)
-[4]    PAN position byte   — 0x5a at home, 0xae at full-left
-[5]    TILT position byte  — 0xb4 at home, 0xf1 at full-up
+[4]    PAN position byte    — unsigned, increasing-with-leftward
+[5]    TILT position byte   — unsigned, increasing-with-upward
 [6]    0x00 trailer
 ```
 
-At home position, the canonical payload is `XX YY YY YY 5a b4 00`
-(`5a b4` = 90, 180). Encoding (signed vs unsigned, byte-to-degree mapping)
-is not yet fully characterized — see `docs/findings.md` for the
-session-by-session capture table. The **client→server command format is
-still unknown** — only server-push state has been observed.
+**Pan encoding (byte 4)** — fully anchored by capturing the mount at both
+mechanical limits via the Blink app:
+
+| Position | Pan byte |
+|---|---|
+| full RIGHT (app limit) | `0x06` (6) |
+| user's "Default View" preset | `0x3e` (62) |
+| user position pre-experiments | `0x5a` (90) |
+| full LEFT (app limit) | `0xae` (174) |
+
+Range: ~168 byte values over the documented 350° pan range → **~2.08°/byte**.
+Convention: byte VALUE increases as the mount rotates LEFTWARD.
+
+**Tilt encoding (byte 5)** — also anchored at both limits, with symmetric
+deltas around the rest position:
+
+| Position | Tilt byte | Delta from rest |
+|---|---|---|
+| full DOWN (app limit) | `0x77` (119) | -61 |
+| rest / center | `0xb4` (180) | 0 |
+| full UP (app limit) | `0xf1` (241) | +61 |
+
+Range: 122 byte values over the documented 125° tilt range → **~1.025°/byte**
+(essentially 1°/byte). Tilt has higher byte-resolution than pan.
+Convention: byte VALUE increases as the mount tilts UPWARD.
+
+**The `0x5a` puzzle:** sessions 1 & 2 (before any deliberate movement) and
+session 11 (after a camera power-cycle) all showed pan byte `0x5a` (90).
+Could be the Rosie's post-boot default, or coincidence. Tilt center is
+proven mechanically central (symmetric deltas); pan center is not
+established — the user's "Default View" preset is `0x3e`, not `0x5a`.
+
+**The client→server command format is still unknown** — only server-push
+state has been observed. Phase 2.3 will tackle that.
 
 The community references (sealad886's TS enum, blinkpy) did not document
 0x06, 0x0c, 0x13, or the bidirectional KEEPALIVE behavior. Original
