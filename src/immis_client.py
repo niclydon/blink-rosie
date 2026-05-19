@@ -350,6 +350,22 @@ def main(argv: Optional[list[str]] = None) -> int:
     snd.add_argument("--payload", default="", help="hex-encoded payload (default empty)")
     snd.add_argument("--duration", type=float, default=15.0, help="how long to hold connection after send")
 
+    sr = sub.add_parser("send-rosie",
+        help="send a high-level Rosie pan/tilt command (wraps to the InlineLVCommand on-wire format)")
+    sr.add_argument("--camera-id", type=int, required=True)
+    sr.add_argument("--network-id", type=int, default=12345)
+    sr.add_argument("--rosie-cmd", dest="rosie_cmd", required=True,
+                    choices=("move", "stop", "home", "set-home", "rosie360"),
+                    help="rosie command name (see LiveViewCommand enum in classes.dex)")
+    sr.add_argument("--pan", type=lambda x: int(x, 0),
+                    help="pan byte for --cmd move (range 0x06=right .. 0x5a=home .. 0xae=left)")
+    sr.add_argument("--tilt", type=lambda x: int(x, 0),
+                    help="tilt byte for --cmd move (range 0x77=down .. 0xb4=home .. 0xf1=up)")
+    sr.add_argument("--duration", type=float, default=20.0,
+                    help="how long to hold connection after send (s); needs to be long enough to see the position-update ACCESSORY_MESSAGE")
+    sr.add_argument("--unsafe", action="store_true",
+                    help="skip pan/tilt range bounds check")
+
     args = ap.parse_args(argv)
 
     if args.cmd == "parse-url":
@@ -359,6 +375,45 @@ def main(argv: Optional[list[str]] = None) -> int:
             "conn_id": t.conn_id, "serial": t.serial,
             "client_id": t.client_id,
         }, indent=2))
+        return 0
+
+    if args.cmd == "send-rosie":
+        ROSIE_CMD_IDS = {
+            "move": 3, "stop": 4, "home": 5, "set-home": 6, "rosie360": 7,
+        }
+        cmd_id = ROSIE_CMD_IDS[args.rosie_cmd]
+        if args.rosie_cmd == "move":
+            if args.pan is None or args.tilt is None:
+                print("ERROR: --pan and --tilt required for --rosie-cmd move", file=sys.stderr)
+                return 2
+            if not args.unsafe:
+                if not (0x06 <= args.pan <= 0xae):
+                    print(f"ERROR: --pan 0x{args.pan:02x} outside observed range 0x06..0xae (use --unsafe to override)", file=sys.stderr)
+                    return 2
+                if not (0x77 <= args.tilt <= 0xf1):
+                    print(f"ERROR: --tilt 0x{args.tilt:02x} outside observed range 0x77..0xf1 (use --unsafe to override)", file=sys.stderr)
+                    return 2
+            rosie_payload = bytes([0, 0, 0, 0, args.pan & 0xff, args.tilt & 0xff, 0])
+        else:
+            rosie_payload = b""
+
+        body = cmd_id.to_bytes(4, "big") + rosie_payload
+        print(f"requesting liveview for ROSIE SEND: owl={args.camera_id} network={args.network_id}")
+        print(f"  rosie command: {args.rosie_cmd} (cmd_id={cmd_id})")
+        if args.rosie_cmd == "move":
+            print(f"  target: pan=0x{args.pan:02x} tilt=0x{args.tilt:02x}")
+        print(f"  on-wire body: {body.hex()} ({len(body)} bytes)")
+        url, command_id, body_resp = _start_liveview(args.camera_id, args.network_id)
+        print(f"  immis url: {url}")
+        print(f"  liveview command_id: {command_id}")
+        target = ImmisTarget.from_url(url)
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        log_path = LOG_DIR / f"immis_rosie-{args.rosie_cmd}-{args.camera_id}-{ts}.jsonl"
+        obs = ImmisObserver(target, log_path, args.duration, send_after_setup=(0x14, body))
+        try:
+            asyncio.run(obs.run())
+        except KeyboardInterrupt:
+            print("interrupted")
         return 0
 
     if args.cmd == "send":

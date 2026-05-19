@@ -12,6 +12,111 @@ Newest at the top. Cite source files / packet captures where applicable.
 - blink-mcp confirmed available on the network for authenticated REST access.
 - Reference repos cloned into `refs/` (not vendored — see `.gitignore`).
 
+## 2026-05-19 — Phase 4 (first send attempts): silent failures, send path needs more analysis
+
+Built `send-rosie` mode in `immis_client.py` — wraps high-level commands
+(`move`, `stop`, `home`, `set-home`, `rosie360`) into the InlineLVCommand
+on-wire format. Fixed an early argparse bug (subparsers `dest="cmd"`
+collided with a new `--cmd` argument in `send-rosie`; renamed to `--rosie-cmd`).
+
+**Two live attempts at `RosieGoHome`, both with the mount silently still:**
+
+| Attempt | Wire body sent (after 9-byte IMMIS header) | Result |
+|---|---|---|
+| 1 | `14 00 00 00 05` (5 bytes: inner type + cmd_id BE) | Server returned the usual position-update ACCESSORY_MESSAGE 196ms later but the position bytes were unchanged (`5a 77`). Mount didn't move. |
+| 2 | `00 00 00 05` (4 bytes: just cmd_id BE, no inner type) | Same — position-update arrived shortly after our TX but bytes unchanged. Mount didn't move. |
+
+**Why both interpretations are plausible from static analysis:**
+
+The receive-side disassembly (`processInlineLVCommandPayload`) reads:
+- type byte from `this[0x310]`
+- command (uint32 BE) from `this[0x311]`
+- payload from `this[0x315]+`
+
+These are offsets in the IMMIStreamSource instance, not bytes on the wire.
+Could be either:
+- The framing layer copies outer msgtype to 0x310, then body bytes 0..3
+  as command, body bytes 4+ as payload → wire body is `[command 4B BE][payload]`
+- Or it copies body byte 0 as type, body bytes 1..4 as command, body 5+ as
+  payload → wire body is `[type 1B][command 4B BE][payload]`
+
+Without disassembling the IMMIS framing parser fully (specifically the
+function that fills offsets 0x310, 0x311, 0x315 of `this`), I can't
+distinguish. Both empirical tests failed identically.
+
+### What disassembling the send-side revealed
+
+The wire-write is NOT a single function. The call chain is:
+
+1. `Java_com_immediasemi_walnut_Player_submitInlineLVCommand` (JNI)
+2. `walnut::PlayerImplementation::submitInlineLVCommand` (forwards args)
+3. `walnut::IMMIStreamSource::submitInlineLVCommand` (validates type, tail-calls)
+4. `walnut::IMMIStreamSource::sendMediaInfo` — found at virtual address
+   `0x170b38`, **632 bytes**, same `(uint8_t, uint32_t, vector<uint8_t>)`
+   signature
+
+`sendMediaInfo` early-on does:
+
+```asm
+0x170b54   ldr  w9, [x3, 8]       ; vector::end_
+0x170b58   ldr  w10, [x3]          ; vector::begin_
+0x170b6c   sub  w9, w9, w10        ; payload size = end - begin
+0x170b68   and  w24, w1, 0xff      ; save type (low byte)
+0x170b70   rev  w23, w2            ; BYTESWAP command (host → BE)
+0x170b74   rev  w22, w9            ; BYTESWAP payload size (host → BE)
+```
+
+Then it does tree-map manipulation (`__tree:1683` source comments) and
+calls `operator new`. **This is queue insertion, not socket write.** The
+function builds a "media info entry" with `[type, command_BE, payload_size_BE,
+payload]` and adds it to a per-stream map keyed by type. Some other thread
+or function later reads from that map and constructs the actual wire bytes.
+
+This means the wire format may include the byteswapped payload_size as a
+separate field — something my earlier "type + command + payload" hypothesis
+missed. A third candidate format:
+
+```
+[outer msgtype = type]                          ; in IMMIS header
+[seq 4B BE]
+[length 4B BE]
+[command 4B BE]
+[payload_size 4B BE]     ← NEW: separate length field for payload
+[payload bytes]
+```
+
+That hasn't been tested yet — would be a logical next experiment when
+resuming Phase 4.
+
+### Why this is the right place to pause
+
+Phase 3 produced a near-complete protocol decode in a single evening: the
+ACCESSORY_MESSAGE wire format, the command channel (0x14), the cmd_id
+enumeration, the receive-side body layout, even the bonus interpretation
+of the 4-byte `06 ae 77 f1` packet as ROSIE_LIMITS. The remaining work to
+move the mount is "find the exact byte-by-byte send framing" — a smaller
+problem that needs another hour of disassembly tracing through
+`sendMediaInfo` and its writer thread to identify exactly what bytes the
+queue's consumer emits to the socket.
+
+Alternative paths that would also close out Phase 4:
+
+1. **Disassemble the queue-consumer/writer function** that actually emits
+   bytes to the TLS socket. That's downstream of `sendMediaInfo` — probably
+   reads the map-of-pending-media-info entries and assembles packets.
+2. **Frida hook the running app**. Once Phase 4-blocking gets re-engaged,
+   we could attach Frida to the Blink Android app on the user's phone (NOT
+   the user's iPhone, just any rooted/emulator Android with the APK) and
+   hook `Java_com_immediasemi_walnut_Player_submitInlineLVCommand`, then
+   pan the mount via the app and dump the exact bytes the JNI passes
+   downstream. Gives ground truth in one capture.
+3. **Try the 8-byte `cmd + payload_size` format** as the next empirical
+   probe.
+
+Logs from tonight's attempts:
+- `logs/immis_rosie-home-1234567-20260519-194811.jsonl` (attempt 1, 5-byte body)
+- `logs/immis_rosie-home-1234567-20260519-195217.jsonl` (attempt 2, 4-byte body)
+
 ## 2026-05-19 — Phase 3 COMPLETE: full cmd_id table + payload formats from classes.dex
 
 After the wire format was extracted from `libwalnut.so`, installed `jadx`
