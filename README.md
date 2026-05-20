@@ -135,13 +135,40 @@ The protocol work in this repo is what enabled those tools.
 ## References
 
 The reverse engineering stood on the shoulders of these community projects;
-the IMMIS framing was already documented even if the rosie command was not:
+the IMMIS framing was already documented even if the rosie command was not.
+Each one was load-bearing in a specific way:
 
-- [`fronzbot/blinkpy`](https://github.com/fronzbot/blinkpy) — cleanest Python IMMIS implementation
-- [`sealad886/homebridge-blink-cameras-new-api`](https://github.com/sealad886/homebridge-blink-cameras-new-api) — most complete TypeScript IMMIS impl, full message-type enum
-- [`MattTW/BlinkMonitorProtocol`](https://github.com/MattTW/BlinkMonitorProtocol) — protocol docs
-- [`jakecrowley/blink-immis-proxy`](https://github.com/jakecrowley/blink-immis-proxy) — Frida + socat MITM kit
-- [`amattu2/blink-liveview-middleware`](https://github.com/amattu2/blink-liveview-middleware) — Go IMMIS proxy with explicit "PTZ TODO"
+- [`fronzbot/blinkpy`](https://github.com/fronzbot/blinkpy) — cleanest
+  Python IMMIS implementation. `blinkpy/livestream.py` was the direct
+  reference for our own IMMIS client: 122-byte auth header construction,
+  the latency-stats + keepalive heartbeat cadence, and the
+  `read(9)`-then-`read(payload_length)` framing loop.
+- [`sealad886/homebridge-blink-cameras-new-api`](https://github.com/sealad886/homebridge-blink-cameras-new-api)
+  — the most complete public IMMIS implementation. The TypeScript
+  `immis-proxy.ts` documents the full `ImmisMessageType` enum
+  (0x00/0x0a/0x12/0x14/0x15/0x17/0x18) and the `sendSessionCommand` cmd_id
+  prefix convention. The disassembly work in this project filled in the
+  gaps that codebase explicitly TODO'd (the accessory-message payload
+  format, the actual cmd_ids for rosie movement).
+- [`colinbendell/homebridge-blink-for-home`](https://github.com/colinbendell/homebridge-blink-for-home)
+  — `src/blink-api.js` documents the camera-scoped Storm accessory REST
+  shape
+  (`/accounts/{a}/networks/{n}/cameras/{c}/accessories/{type}/{id}/...`).
+  That URL pattern was the template for our exhaustive rosie REST probing
+  in Phase 1, which ruled REST out as the rosie control surface.
+- [`MattTW/BlinkMonitorProtocol`](https://github.com/MattTW/BlinkMonitorProtocol)
+  — community protocol documentation; useful general REST surface mapping.
+- [`jakecrowley/blink-immis-proxy`](https://github.com/jakecrowley/blink-immis-proxy)
+  — a complete Frida + socat MITM kit for capturing decrypted IMMIS
+  traffic from a rooted Android device. We didn't end up needing the MITM
+  path (static analysis of `libwalnut.so` got us there) but the
+  `inject-tls-verify-hook.py` Frida script provided the
+  `mbedtls_x509_crt_verify_with_profile` symbol hint that pointed at
+  `libwalnut.so` as the right binary to analyze.
+- [`amattu2/blink-liveview-middleware`](https://github.com/amattu2/blink-liveview-middleware)
+  — Go IMMIS proxy. Crucially: `common/tcp.go` line 42 has an explicit
+  `TODO: Support command I/O (e.g. PTZ commands)` comment. That comment is
+  what motivated this entire investigation.
 
 The decisive step was static analysis of `libwalnut.so` from the Blink
 Android app — the unstripped binary with debug info exposed function names
