@@ -12,6 +12,102 @@ Newest at the top. Cite source files / packet captures where applicable.
 - blink-mcp confirmed available on the network for authenticated REST access.
 - Reference repos cloned into `refs/` (not vendored — see `.gitignore`).
 
+## 2026-05-19 — 🎉 PHASE 4 VERIFIED: ROSIE PHYSICALLY MOVED ON FIRST PROGRAMMATIC COMMAND
+
+Sent a `RosieMove(pan=0x5a, tilt=0xb4)` with the new wire format
+(cmd_id in seq position, payload immediately after the 9-byte header).
+The mount **physically moved** and the server streamed real-time
+position-update ACCESSORY_MESSAGEs every ~140ms as the motion progressed:
+
+```
+t=2.770s   POSITION  pan=0x5a tilt=0x77 flag=0x00   ← starting state
+t=2.781s   TX 0x14 INLINE_COMMAND seq=3 len=7 hex=000000005ab400
+t=3.175s   POSITION  pan=0x5a tilt=0x7c flag=0x01   ← motion begins
+t=3.432s   POSITION  pan=0x5a tilt=0x80 flag=0x01
+t=3.670s   POSITION  pan=0x5a tilt=0x84 flag=0x01
+t=3.916s   POSITION  pan=0x5a tilt=0x88 flag=0x01
+t=4.183s   POSITION  pan=0x5a tilt=0x8c flag=0x01
+t=4.429s   POSITION  pan=0x5a tilt=0x91 flag=0x01
+t=4.735s   POSITION  pan=0x5a tilt=0x95 flag=0x01
+t=5.206s   POSITION  pan=0x5a tilt=0x99 flag=0x01
+t=5.755s   POSITION  pan=0x5a tilt=0x9d flag=0x01
+t=5.803s   POSITION  pan=0x5a tilt=0xa1 flag=0x01
+t=6.309s   POSITION  pan=0x5a tilt=0xa5 flag=0x01
+t=6.315s   POSITION  pan=0x5a tilt=0xaa flag=0x01
+t=6.412s   POSITION  pan=0x5a tilt=0xae flag=0x01
+t=6.601s   POSITION  pan=0x5a tilt=0xb2 flag=0x01
+t=6.705s   POSITION  pan=0x5a tilt=0xb4 flag=0x00   ← arrived at target; motion-flag clears
+```
+
+User visually confirmed: "it just moved". The mount swung from tilt
+position 0x77 to the commanded tilt 0xb4 over ~3.9 seconds.
+
+### Locked-in protocol facts
+
+**Wire format for InlineLVCommand (0x14) and SessionCommand (0x17):**
+
+```
+[byte 0]      msgtype          (0x14 or 0x17)
+[bytes 1-4]   command (cmd_id) (uint32 BIG-ENDIAN)   ← in the standard "seq" position
+[bytes 5-8]   length           (uint32 BIG-ENDIAN)   ← length of payload
+[bytes 9+]    payload          (variable)
+```
+
+For RosieMove the on-wire packet is **16 bytes total**:
+```
+14  00 00 00 03  00 00 00 07  00 00 00 00 5a b4 00
+```
+
+For RosieGoHome / RosieStop / RosieSetHome / Rosie360 the packet is just
+**9 bytes** (header-only, no payload):
+```
+14  00 00 00 NN  00 00 00 00     where NN = 5,4,6,7 respectively
+```
+
+**The 7-byte RosieMove payload structure** (confirmed via reflected
+position state during motion):
+
+```
+[byte 0]      state-version counter (the server increments)
+[bytes 1-3]   state-change hash
+[byte 4]      PAN target byte
+[byte 5]      TILT target byte
+[byte 6]      MOTION-IN-PROGRESS FLAG  (0x00 stationary, 0x01 moving)
+                  ← new interpretation! Previously called the "0x00 trailer".
+                  ← Now verified by observing it flip 0→1→0 during the move.
+```
+
+**Position-update telemetry rate during motion:** the server pushes a
+fresh ACCESSORY_MESSAGE (msgtype 0x15, seq=2) every ~140ms while the
+mount is in motion. When the motion completes, byte 6 returns to 0x00
+and the rate drops back to the "session start only" pattern.
+
+**Motion rate:** ~15ms per byte-value change on the tilt axis (61 byte
+values traversed in ~3.9 seconds). At 1.025°/byte, that's about
+67°/second — a deliberate, smooth physical movement.
+
+### Interpretive note from user
+
+User observed that the starting position (tilt=0x77, which we'd labeled
+"tilt-down") was visually "upright". So either:
+- Camera mounting geometry inverts the app-relative direction
+- Our "0x77 = down, 0xb4 = center, 0xf1 = up" label scheme needs
+  reframing relative to physical mount orientation
+
+The byte-to-byte mechanical relationship is unchanged; only the
+human-readable labels are ambiguous. Phase 5 may want to re-map labels
+to physical observation when the user is in position to watch.
+
+### Phase 4 status
+
+**COMPLETE.** First publicly documented programmatic control of a Blink
+Rosie pan/tilt mount, end-to-end:
+- Authenticated REST session
+- IMMIS TLS connection with 122-byte auth header
+- INLINE_COMMAND wire format with cmd_id in seq position
+- Verified by physical mount motion + real-time position-update
+  telemetry stream
+
 ## 2026-05-19 — Phase 4 deepens: cmd_id likely lives in the SEQ position of the IMMIS header
 
 After 4 silent send-format attempts and 1 attempt that elicited a 0x08

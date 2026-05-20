@@ -265,12 +265,26 @@ For RosieMove home (pan=0x5a, tilt=0xb4) it's 16 bytes:
 14  00 00 00 03  00 00 00 07  00 00 00 00 5a b4 00
 ```
 
-This wire format hypothesis was derived 2026-05-19 evening but only
-empirically tested in a degraded camera session (post multiple reboots),
-which closed 52ms after our TX rather than moving the mount or providing
-a NACK. The 52ms direct-reaction timing is strong indirect evidence the
-format is correct. Clean test requires waiting for the camera relay to
-recover. See `docs/findings.md` for the full investigation log.
+**VERIFIED PHYSICALLY on 2026-05-19 evening.** Sent
+`RosieMove(pan=0x5a, tilt=0xb4)` and the mount physically moved. The
+server streamed real-time position-update ACCESSORY_MESSAGEs every
+~140ms during motion, with the tilt byte incrementing from 0x77 →
+0xb4 over ~3.9 seconds. The user confirmed visually.
+
+**Bonus finding during the verified motion:** byte 6 of the 7-byte
+ACCESSORY_MESSAGE payload (previously labeled "0x00 trailer") is the
+**motion-in-progress flag** — `0x01` while moving, `0x00` when
+stationary. Updated payload structure:
+
+```
+[byte 0]    state-version counter (server-incremented)
+[bytes 1-3] state-change hash
+[byte 4]    PAN byte
+[byte 5]    TILT byte
+[byte 6]    motion-flag: 0x01 if mount is in motion, 0x00 if stationary
+```
+
+See `docs/findings.md` for the full motion log.
 
 The receive-side handler in `WalnutRosieNavigator.java` confirms our
 Phase 2 wire-format decode byte-for-byte (`payload[4]` = pan,
