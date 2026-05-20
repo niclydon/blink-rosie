@@ -12,6 +12,98 @@ Newest at the top. Cite source files / packet captures where applicable.
 - blink-mcp confirmed available on the network for authenticated REST access.
 - Reference repos cloned into `refs/` (not vendored — see `.gitignore`).
 
+## 2026-05-19 — Phase 4 continued: 4 send-format attempts, identified 0x08 as STOP
+
+After the first two silent send attempts (5-byte and 4-byte body formats),
+disassembled the `processMessage` dispatcher to disambiguate the body
+layout. The comparisons in the dispatch table:
+
+```
+cmp w21, 0x06   cmp w21, 0x0a   cmp w21, 0x0c
+cmp w21, 0x12   cmp w21, 0x13   cmp w21, 0x15
+cmp w21, 0x18   cmp w21, 0x08   ...
+```
+
+**Every comparison value matches an IMMIS msgtype we've observed** (0x06,
+0x0a, 0x0c, 0x12, 0x13, 0x15, 0x18). That definitively proves the byte at
+`this[0x310]` is the outer IMMIS msgtype set by the framing parser — NOT
+a separate inner byte in the body. So the 4-byte body format (no inner
+type prefix) was the correctly-framed one.
+
+### Two more wire-format attempts
+
+| Attempt | Body | Outer msgtype | Server response |
+|---|---|---|---|
+| 3: cmd + payload_size | `00000005 00000000` (8 bytes) for RosieGoHome | 0x14 | None visible — still silent |
+| 4: RosieMove home (v2 format, 11-byte body) | `00000003 00000000 5a b4 00` | 0x14 | **SERVER SENT 0x08 STOP** at t+15s, then closed connection at t+15.8s |
+
+The session for attempt 4 was already abnormal — video never started (no
+first_video event, no ACCESSORY_MESSAGE seq=2 position snapshot). Setup
+burst stopped at 0x13. After our 0x14 send fired (because the wait-for-
+first-video timer expired), the server sent a 0x08 message ~15s later and
+closed the connection 0.8s after that.
+
+### What 0x08 means
+
+`walnut::IMMIStreamSource::sendStop(unsigned int)` exists at virtual address
+`0x16f8e4` (128 bytes) — the client-side function to send a stop. Strings
+in the binary confirm:
+
+- `"StreamSource is stopped - %s"`
+- `"StreamSource has unexpectedly stopped. Stopping the player."`
+
+And the dispatcher branch is `cmp w21, 8; b.eq 0x16fc5c` — msgtype `0x08`
+routes to a stop-handling branch.
+
+**Conclusion: msgtype `0x08` is STOP, sent by either direction to signal
+session teardown.** This is the first time we've seen the server emit 0x08
+in any session.
+
+### What this leaves unresolved
+
+Whether 0x08 was a direct response to our 0x14 send (server detected
+protocol violation → STOP) or an independent decision to tear down an
+already-malformed session (no video had started). The 15-second gap
+between our send and the 0x08 is unusual — too long to be a synchronous
+NACK, but well-correlated enough to be suspicious.
+
+Either way: **4 distinct body formats have been tried for InlineLVCommand
+send. None have produced mount motion.** Static analysis has gone as deep
+as it can without disassembling the queue-consumer in `sendMediaInfo` that
+actually emits bytes to the TLS socket — and even that may not resolve the
+question if the issue is auth/permission/session-state rather than bytes.
+
+### What's left to try (whenever Phase 4 is resumed)
+
+1. **Frida MITM on an Android emulator** — install the Blink APK on Bliss
+   OS or Android Studio AVD with Frida, hook
+   `Java_com_immediasemi_walnut_Player_submitInlineLVCommand`, pan the
+   mount via the real app, dump the exact bytes that hit the TLS socket.
+   Definitive resolution.
+2. **Disassemble the queue-consumer** downstream of `sendMediaInfo`. The
+   queue is keyed by msgtype at `this+0x430` (and 0x438, 0x440). Find the
+   function that reads from those addresses and writes to the socket.
+3. **Investigate the multi-client live view (MCLV) state machine.** The
+   `is_mclv: true` field in `/liveview` responses suggests an MCLV protocol
+   that may require explicit controller-role assertion before commands
+   are accepted. Look for "controller" / "primary" / "join" string
+   constants in libwalnut.
+
+The night's static analysis produced an exceptionally thorough decode of
+the Blink IMMIS protocol — wire formats for the read direction, message
+type table including four previously-undocumented types (0x06, 0x08, 0x0c,
+0x13), full command-id enumeration from Kotlin classes.dex, the
+ROSIE_LIMITS interpretation, and the `walnut::*` C++ symbol map. The
+final mile to making the mount physically move requires capturing one real
+client→server pan/tilt packet from a running Blink app, which static
+analysis alone cannot deliver.
+
+Logs:
+- `logs/immis_rosie-home-1234567-20260519-194811.jsonl` — attempt 1 (5B body)
+- `logs/immis_rosie-home-1234567-20260519-195217.jsonl` — attempt 2 (4B body)
+- `logs/immis_rosie-home-1234567-20260519-200318.jsonl` — attempt 3 (8B body)
+- `logs/immis_rosie-move-1234567-20260519-201327.jsonl` — attempt 4 (RosieMove + 0x08 STOP)
+
 ## 2026-05-19 — Phase 4 (first send attempts): silent failures, send path needs more analysis
 
 Built `send-rosie` mode in `immis_client.py` — wraps high-level commands
