@@ -241,14 +241,36 @@ The full table is in `com.immediasemi.blink.utils.liveview.LiveViewCommand`:
 | 0x17 | 0x17 | 4 | StopAudio | empty |
 | 0x17 | 0x17 | 5 | ToggleExtended | _unknown_ |
 
-So the on-wire RosieMove command, panning to home (0x5a) and tilting to
-center (0xb4):
+**Wire format for INLINE_COMMAND (0x14) and SESSION_COMMAND (0x17)
+packets** — derived from disassembling `sendMediaInfo`'s 9-byte buffer
+allocation and matching to the receive-side parser:
 
 ```
-14  XX XX XX XX  00 00 00 0c   14  00 00 00 03   00 00 00 00 5a b4 00
-└────── msgtype ───────────── ─┘ └─inner type─┘└─cmd_id=3─┘└── 7-byte payload ──┘
-                              length=12=0x0c
+[byte 0]      msgtype = 0x14 or 0x17
+[bytes 1-4]   command (uint32 BE)   ← cmd_id rides HERE in the seq position
+[bytes 5-8]   length  (uint32 BE)   ← payload size
+[bytes 9+]    payload (variable)
 ```
+
+For RosieGoHome (cmd_id=5, empty payload) the entire on-wire packet is
+just 9 bytes:
+
+```
+14  00 00 00 05  00 00 00 00
+```
+
+For RosieMove home (pan=0x5a, tilt=0xb4) it's 16 bytes:
+
+```
+14  00 00 00 03  00 00 00 07  00 00 00 00 5a b4 00
+```
+
+This wire format hypothesis was derived 2026-05-19 evening but only
+empirically tested in a degraded camera session (post multiple reboots),
+which closed 52ms after our TX rather than moving the mount or providing
+a NACK. The 52ms direct-reaction timing is strong indirect evidence the
+format is correct. Clean test requires waiting for the camera relay to
+recover. See `docs/findings.md` for the full investigation log.
 
 The receive-side handler in `WalnutRosieNavigator.java` confirms our
 Phase 2 wire-format decode byte-for-byte (`payload[4]` = pan,

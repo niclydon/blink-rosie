@@ -123,12 +123,13 @@ class ImmisObserver:
         target: ImmisTarget,
         log_path: Path,
         duration_s: float,
-        send_after_setup: Optional[tuple[int, bytes]] = None,
+        send_after_setup: Optional[tuple] = None,
     ):
         self.target = target
         self.log_path = log_path
         self.duration_s = duration_s
-        self.send_after_setup = send_after_setup  # (msgtype, payload) or None
+        # send_after_setup: (msgtype, payload) for auto-seq, or (msgtype, payload, seq) for explicit seq
+        self.send_after_setup = send_after_setup
         self.reader: Optional[asyncio.StreamReader] = None
         self.writer: Optional[asyncio.StreamWriter] = None
         self.log_fh = None
@@ -242,15 +243,18 @@ class ImmisObserver:
     async def _send_after_setup(self) -> None:
         if self.send_after_setup is None:
             return
-        msgtype, payload = self.send_after_setup
+        if len(self.send_after_setup) == 3:
+            msgtype, payload, seq = self.send_after_setup
+        else:
+            msgtype, payload = self.send_after_setup
+            self.tx_seq_by_type[msgtype] = self.tx_seq_by_type.get(msgtype, 0) + 1
+            seq = self.tx_seq_by_type[msgtype]
         try:
             await asyncio.wait_for(self.setup_complete_event.wait(), timeout=10.0)
         except asyncio.TimeoutError:
             print(f"  send: setup never completed (no first_video) — sending anyway")
         await asyncio.sleep(0.3)  # let any final setup-burst packets land
         assert self.writer is not None
-        self.tx_seq_by_type[msgtype] = self.tx_seq_by_type.get(msgtype, 0) + 1
-        seq = self.tx_seq_by_type[msgtype]
         pkt = frame(msgtype, seq, payload)
         name = _name_for(msgtype)
         print(f"  TX  0x{msgtype:02x} {name:<18} seq={seq} len={len(payload)}  payload={payload.hex()}")
@@ -397,7 +401,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         else:
             rosie_payload = b""
 
-        body = cmd_id.to_bytes(4, "big") + rosie_payload
+        # The cmd_id rides in the SEQ POSITION of the IMMIS header, not in the body.
+        # Discovered 2026-05-19 by analyzing sendMediaInfo's 9-byte-header allocation.
+        body = rosie_payload
         print(f"requesting liveview for ROSIE SEND: owl={args.camera_id} network={args.network_id}")
         print(f"  rosie command: {args.rosie_cmd} (cmd_id={cmd_id})")
         if args.rosie_cmd == "move":
@@ -409,7 +415,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         target = ImmisTarget.from_url(url)
         ts = time.strftime("%Y%m%d-%H%M%S")
         log_path = LOG_DIR / f"immis_rosie-{args.rosie_cmd}-{args.camera_id}-{ts}.jsonl"
-        obs = ImmisObserver(target, log_path, args.duration, send_after_setup=(0x14, body))
+        # Pass cmd_id as the "seq" field of the IMMIS frame
+        obs = ImmisObserver(target, log_path, args.duration,
+                            send_after_setup=(0x14, body, cmd_id))
         try:
             asyncio.run(obs.run())
         except KeyboardInterrupt:

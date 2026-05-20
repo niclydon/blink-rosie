@@ -12,6 +12,111 @@ Newest at the top. Cite source files / packet captures where applicable.
 - blink-mcp confirmed available on the network for authenticated REST access.
 - Reference repos cloned into `refs/` (not vendored — see `.gitignore`).
 
+## 2026-05-19 — Phase 4 deepens: cmd_id likely lives in the SEQ position of the IMMIS header
+
+After 4 silent send-format attempts and 1 attempt that elicited a 0x08
+STOP message, traced the byte-construction in `sendMediaInfo` itself.
+The key sequence at offset 0x170c08-0x170c2c:
+
+```asm
+0x170c08   movz w0, 0x9                ; w0 = 9 (allocation size)
+0x170c14   bl operator new              ; allocate 9-byte buffer
+0x170c1c   add x8, x0, 9                ; x8 = buffer + 9 (vector::end)
+0x170c20   strb w24, [x0]               ; buffer[0] = type byte
+0x170c28   stp x8, x8, [x29, -0x10]     ; build std::vector header on stack
+0x170c2c   stur w22, [x0, 5]            ; buffer[5..8] = payload_size BE
+```
+
+**The allocated buffer is exactly 9 bytes — the standard IMMIS header.**
+The function does NOT allocate space for a separate "command" body field.
+But the function signature is `submitInlineLVCommand(type, command,
+payload)` — three args, and the function explicitly byteswaps `command`
+to BE earlier (`rev w23, w2`).
+
+**Where does the byteswapped `command` go?** Almost certainly into the
+SEQ POSITION of the IMMIS header (bytes 1-4 of the 9-byte buffer). I
+didn't capture the explicit `str w23, [x0, 1]` instruction in my filtered
+output, but the structural evidence is conclusive:
+
+- The buffer is 9 bytes total — only room for `[type][?_4B][length_4B]`
+- The function has byteswapped `command` (= w23) and has nowhere else to
+  put it before the buffer goes to the writer
+- This perfectly matches the receive-side disassembly that reads:
+  - `this[0x310]` = type (header byte 0)
+  - `this[0x311..0x315]` = "command" (header bytes 1-4, the seq position!)
+  - `this[0x315..]` = payload (immediately after the 9-byte header)
+
+**The wire format for InlineLVCommand and SessionCommand packets is:**
+
+```
+[byte 0]      msgtype = type     (0x14 INLINE_COMMAND or 0x17 SESSION_COMMAND)
+[bytes 1-4]   command   (uint32 BE)   ← the cmd_id! repurposed from "seq"
+[bytes 5-8]   length    (uint32 BE)   ← length of payload bytes
+[bytes 9+]    payload   (variable)
+```
+
+So for RosieGoHome the entire on-wire packet is just **9 bytes** with no
+body at all:
+
+```
+14  00 00 00 05  00 00 00 00
+```
+
+For RosieMove home (pan=0x5a, tilt=0xb4): **16 bytes total**:
+
+```
+14  00 00 00 03  00 00 00 07  00 00 00 00 5a b4 00
+```
+
+### Attempt 5: live test of the new format
+
+Tried RosieMove home with the corrected format (cmd_id in seq position,
+length = payload size, payload immediately following). Camera was in a
+degraded post-reboot state — no setup burst, no video, only auth ACK +
+keepalive ping-pong.
+
+| Event | Time |
+|---|---|
+| auth header sent | t=0 |
+| auth ACK received | t=0.145s |
+| 2 keepalive round-trips | t=0-10s (no setup burst, no video) |
+| TX 0x14 seq=3 len=7 hex=`000000005ab400` | t=10.373s |
+| **Server closed connection (EOF)** | t=10.425s |
+
+**52ms between our TX and the server closing the connection.** That's
+direct-reaction territory — much faster than the 15-second 0x08 STOP we
+saw on the prior attempt. The server received and reacted to our packet.
+
+Whether the close was because:
+- Our format is now correct and the server processed it but the degraded
+  session state couldn't honor the command
+- Our format is still slightly off and the server rejected with an
+  immediate close
+- The server was going to close anyway (degraded state) and the timing is
+  coincidental
+
+is unprovable without a clean session. Camera-side is in a recovery state
+after multiple reboots over the past 4 hours; needs fresh state to retest.
+
+### Phase 4 status at end of 2026-05-19 session
+
+- Wire format probably solved: cmd_id rides in the seq position of the
+  9-byte IMMIS header, NOT as a separate body field
+- 5 send attempts tonight, none produced visible mount motion
+- Strong indirect evidence on this 5th attempt (52ms close after TX)
+- Camera in degraded state — needs recovery before clean retest
+
+### Recommended next session
+
+1. Wait for the camera-side state to recover (probably overnight; or one
+   more user power-cycle followed by a wait period)
+2. Verify normal setup-burst completes (look for the ACCESSORY_MESSAGE
+   seq=4 ROSIE_LIMITS and seq=2 POSITION in setup) before sending
+3. Send RosieGoHome with the new format. Empty payload, 9 bytes total.
+   Lowest-risk verification of the format.
+4. If the mount moves, the protocol is conclusively decoded. If not,
+   pivot to Frida MITM on Android emulator for ground-truth byte capture.
+
 ## 2026-05-19 — Phase 4 continued: 4 send-format attempts, identified 0x08 as STOP
 
 After the first two silent send attempts (5-byte and 4-byte body formats),
